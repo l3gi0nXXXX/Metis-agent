@@ -160,7 +160,7 @@ public func servicePluginHistoricalLeaseMatchesParent(lease: ServicePluginHistor
 }
 
 public func probeServicePluginHistoricalResources(parentPid: Int64, parentStartedAtMs: Int64,
-    deadline: MonoTime): ServicePluginHistoricalRecoveryResult {
+    deadline: MonoTime, allowStaleActiveLease!: Bool = false): ServicePluginHistoricalRecoveryResult {
     let evidence = ArrayList<ServicePluginHistoricalLeaseEvidence>()
     let fail = { status: String => ServicePluginHistoricalRecoveryResult(false, false, status,
         evidence: evidence.toArray(), parentPid: parentPid, parentStartedAtMs: parentStartedAtMs) }
@@ -193,7 +193,7 @@ public func probeServicePluginHistoricalResources(parentPid: Int64, parentStarte
                 if (!servicePluginHistoricalLeaseMatchesParent(lease, parentPid, parentStartedAtMs)) { return fail("identity_mismatch") }
                 evidence.add(lease)
                 if (lease.state != "stopped" && !["running", "starting", "stopping"].contains(lease.state)) { return fail("lease_state_unknown") }
-                if (lease.state != "stopped") { return ServicePluginHistoricalRecoveryResult(true, false, "lease_active", evidence: evidence.toArray(), parentPid: parentPid, parentStartedAtMs: parentStartedAtMs) }
+                if (lease.state != "stopped" && !allowStaleActiveLease) { return ServicePluginHistoricalRecoveryResult(true, false, "lease_active", evidence: evidence.toArray(), parentPid: parentPid, parentStartedAtMs: parentStartedAtMs) }
                 let pid = servicePluginProbePid(lease.pid, hostDeadline)
                 if (!pid.conclusive) { return fail(pid.status) }
                 if (pid.alive) { return ServicePluginHistoricalRecoveryResult(true, false, "pid_alive", evidence: evidence.toArray(), parentPid: parentPid, parentStartedAtMs: parentStartedAtMs) }
@@ -208,8 +208,9 @@ public func probeServicePluginHistoricalResources(parentPid: Int64, parentStarte
 }
 
 public func revalidateServicePluginHistoricalEvidence(evidence: ServicePluginHistoricalRecoveryResult,
-    deadline: MonoTime): ServicePluginHistoricalRecoveryResult {
-    let current = probeServicePluginHistoricalResources(evidence.parentPid, evidence.parentStartedAtMs, deadline)
+    deadline: MonoTime, allowStaleActiveLease!: Bool = false): ServicePluginHistoricalRecoveryResult {
+    let current = probeServicePluginHistoricalResources(evidence.parentPid, evidence.parentStartedAtMs, deadline,
+        allowStaleActiveLease: allowStaleActiveLease)
     if (!current.terminal) { return current }
     if (current.matchedCount != evidence.matchedCount) { return ServicePluginHistoricalRecoveryResult(false, false, "identity_changed") }
     for (previous in evidence.evidence) {
