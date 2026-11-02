@@ -82,7 +82,8 @@ public func gatewayChannelRuntimeReportPersistenceOutcome(
     if (emit) {
         gatewayChannelRuntimeTryDiagnostic({ =>
             let meta = gatewayLogMeta().string("channel", channelId).identityHash("accountHash", accountId)
-                .string("status", result.status).bool("persisted", result.persisted).object()
+                .string("status", result.status).bool("persisted", result.persisted)
+                .value("fdObservation", gatewayObserveFdPressure(if (result.persisted) { "recovered" } else { "persist" })).object()
             if (result.persisted) {
                 gatewayLogEventInfo("gateway/channel", "channel.runtime.persistence.recovered", "channel runtime persistence recovered", meta: meta)
             } else {
@@ -124,6 +125,9 @@ private func gatewayChannelRuntimeReadState(): JsonObject {
                 for (i in 0..accounts.size()) {
                     let row = accounts[i].asObject()
                     // Reject damaged control values instead of silently defaulting them to permission to start.
+                    for (key in ["channelId", "accountId"]) {
+                        match (row.get(key)) { case Some(v) => let _ = v.asString() case None => () }
+                    }
                     match (row.get("manualStop")) { case Some(v) => let _ = v.asBool() case None => () }
                     for (key in ["restartBudget", "nextRestartAtMs"]) {
                         match (row.get(key)) { case Some(v) => let _ = Int64.parse(v.toJsonString()) case None => () }

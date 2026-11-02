@@ -65,6 +65,48 @@ private func shellDeadlineTempArtifactCount(): Int64 {
 @Test
 public class ShellUtilsTest {
     @TestCase
+    public func fdS2N1FailureReporterCannotChangeCommandResult(): Unit {
+        let calls = ArrayList<String>()
+        let previous = setShellCommandFailureReporter(Some({ code, kind =>
+            calls.add(kind)
+            @Expect(code, 7)
+            throw Exception("synthetic reporter failure 中文😀")
+        }))
+        try {
+            let result = ShellUtils.execute(["/bin/sh", "-c", "printf '中文😀'; exit 7"],
+                withWrap: false, logFailures: true)
+            @Expect(result[0], 7)
+            @Expect(result[1], "中文😀")
+            @Expect(calls.size, 1)
+            @Expect(calls[0], "captured")
+        } finally { let _ = setShellCommandFailureReporter(previous) }
+    }
+
+    @TestCase
+    public func fdS2N2TimedFailureReporterPreservesBrokerFailure(): Unit {
+        let client = ManagedStdioBrokerClient(nodeCommand: "metis-owned-nonexistent-node")
+        let calls = ArrayList<String>()
+        let previous = setShellCommandFailureReporter(Some({ _code, kind =>
+            calls.add(kind)
+            throw Exception("synthetic reporter failure")
+        }))
+        debugSetShellBrokerProviderForTest(Some({ => client }))
+        try {
+            let result = ShellUtils.execute(["/usr/bin/true"], withWrap: false,
+                timeout: Some(Duration.second), logFailures: true)
+            @Expect(result[0] != 0, true)
+            @Expect(result[2], "broker_unavailable")
+            @Expect(calls.size, 1)
+            @Expect(calls[0], "timed")
+        } finally {
+            let _ = setShellCommandFailureReporter(previous)
+            debugSetShellBrokerProviderForTest(None<() -> ManagedStdioBrokerClient>)
+            let _ = client.close(timeoutMs: 500)
+        }
+    }
+
+
+    @TestCase
     public func executeUsesStdProcessCaptureForNoTimeoutCommands(): Unit {
         let (exitCode, stdout, stderr) = ShellUtils.execute(
             ["printf", "hello-shell-utils"],

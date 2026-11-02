@@ -126,7 +126,9 @@ public class GatewayFdExhaustionTest {
             let path = Path(gatewayChannelRuntimeStatePath())
             let invalidBytes: Array<Byte> = [0xff, 0xfe]
             let invalid = [invalidBytes, "{中文😀".toArray(), "{\"accounts\":{}}".toArray(),
-                "{\"accounts\":[{\"manualStop\":\"true\"}]}".toArray()]
+                "{\"accounts\":[{\"manualStop\":\"true\"}]}".toArray(),
+                "{\"accounts\":[{\"channelId\":42,\"manualStop\":true}]}".toArray(),
+                "{\"accounts\":[{\"channelId\":\"telegram\",\"accountId\":{},\"manualStop\":true}]}".toArray()]
             for (i in 0..invalid.size) {
                 File.writeTo(path, invalid[i])
                 let result = fdS1Tick()
