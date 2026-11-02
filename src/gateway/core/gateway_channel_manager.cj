@@ -52,7 +52,7 @@ public func gatewayChannelAccountIdsEquivalent(channelId: String, left: String, 
 public func gatewaySanitizeChannelDiagnostic(raw: String): String {
     var detail = raw.trimAscii().replace("\n", " ").replace("\r", " ").replace("\t", " ")
     if (detail.size > 240) {
-        detail = detail[0..240] + "..."
+        detail = metisSafeUtf8Prefix(detail, 240, marker: "...")
     }
     let lower = detail.toAsciiLower()
     if (
@@ -73,7 +73,7 @@ public func gatewaySanitizeChannelDiagnostic(raw: String): String {
 public func gatewayLogEventValue(raw: String): String {
     var detail = gatewaySanitizeChannelDiagnostic(raw)
     if (detail.size > 160) {
-        detail = detail[0..160] + "..."
+        detail = metisSafeUtf8Prefix(detail, 160, marker: "...")
     }
     "\"" + detail.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 }
@@ -1613,98 +1613,77 @@ public class GatewayChannelManager {
     }
 
     public func processOnce(handleInbound: (InboundMessage, String) -> Unit): Unit {
-        if (!this.started) {
-            return
-        }
+        if (!this.started) { return }
         for (entry in this.adapters) {
-            let _ = gatewayChannelRuntimeMarkMonitorTick(entry.channelId, accountId: entry.accountId)
-            try {
-                let messages = entry.adapter.pullInbound()
-                if (messages.size > 0) {
-                    let now = this.liveNowMs()
-                    this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
-                        state.running = true
-                        state.connected = true
-                        state.lastInboundAt = now
-                        state.lastError = ""
-                    })
-                }
-                let inboundCount = Int64(messages.size)
-                gatewayChannelRuntimeMarkPull(entry.channelId, accountId: entry.accountId, inboundCount: inboundCount)
-                let pullMeta = gatewayLogMeta()
-                    .string("channel", entry.channelId)
-                    .string("accountId", entry.accountId)
-                    .string("phase", "pull")
-                    .string("status", "ok")
-                    .int("inboundCount", inboundCount)
-                    .object()
-                if (inboundCount > 0) {
-                    gatewayLogEventInfo(
-                        "gateway/channel/${entry.channelId}",
-                        "channel.pull",
-                        "channel pull completed",
-                        meta: pullMeta
-                    )
-                } else {
-                    gatewayLogEventDebug(
-                        "gateway/channel/${entry.channelId}",
-                        "channel.pull",
-                        "channel pull completed",
-                        meta: pullMeta
-                    )
-                }
-                for (message in messages) {
-                    try {
-                        handleInbound(message, entry.accountId)
-                    } catch (e: Exception) {
-                        this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
-                            state.running = true
-                            state.connected = true
-                            state.lastError = e.message.trimAscii()
-                        })
-                        gatewayChannelRuntimeMarkInboundFailure(entry.channelId, accountId: entry.accountId, error: e.message)
-                        gatewayLogEventError(
-                            "gateway/channel/${entry.channelId}",
-                            "channel.failed",
-                            "channel inbound handler failed",
-                            meta: gatewayLogMeta()
-                                .string("channel", channelToString(message.channel))
-                                .string("accountId", entry.accountId)
-                                .string("phase", "inbound")
-                                .string("status", "failed")
-                                .identityHash("peerHash", message.peerId)
-                                .string("errorKind", "inbound_failed")
-                                .rawString("error", e.message)
-                                .object()
-                        )
-                    }
-                }
-            } catch (e: Exception) {
+            let _ = gatewayChannelRuntimeTryObservationUpdate(entry.channelId, entry.accountId, { =>
+                gatewayChannelRuntimeMarkMonitorTick(entry.channelId, accountId: entry.accountId)
+            })
+            // Only adapter pull failures may change the live channel into backoff.
+            let messages = try { entry.adapter.pullInbound() } catch (e: Exception) {
                 this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                     state.running = false
                     state.connected = false
                     state.lastError = e.message.trimAscii()
                 })
-                gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "backoff", error: e.message, errorKind: "pull_failed", backoffMs: 1000)
-                gatewayLogEventError(
-                    "gateway/channel/${entry.channelId}",
-                    "channel.failed",
-                    "channel pull failed",
-                    meta: gatewayLogMeta()
-                        .string("channel", entry.channelId)
-                        .string("accountId", entry.accountId)
-                        .string("phase", "pull")
-                        .string("status", "failed")
-                        .string("errorKind", "pull_failed")
-                        .rawString("error", e.message)
-                        .object()
-                )
+                // This update consumes restart budget, so keep it strict and report a failed commit.
+                let controlCommit = try {
+                    let _ = gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId,
+                        lifecycleState: "backoff", error: e.message, errorKind: "pull_failed", backoffMs: 1000)
+                    true
+                } catch (_: Exception) {
+                    gatewayChannelRuntimeReportPersistenceOutcome(entry.channelId, entry.accountId,
+                        GatewayChannelRuntimeObservationResult(false, "state_write_failed"))
+                    false
+                }
+                gatewayChannelRuntimeTryDiagnostic({ =>
+                    gatewayLogEventError("gateway/channel/${entry.channelId}", "channel.failed", "channel pull failed",
+                        meta: gatewayLogMeta().string("channel", entry.channelId).string("accountId", entry.accountId)
+                            .string("phase", "pull").string("status", "failed").string("errorKind", "pull_failed")
+                            .bool("controlCommitted", controlCommit).rawString("error", e.message).object())
+                })
+                continue
+            }
+            if (messages.size > 0) {
+                let now = this.liveNowMs()
+                this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
+                    state.running = true
+                    state.connected = true
+                    state.lastInboundAt = now
+                    state.lastError = ""
+                })
+            }
+            let inboundCount = Int64(messages.size)
+            let _ = gatewayChannelRuntimeTryObservationUpdate(entry.channelId, entry.accountId, { =>
+                gatewayChannelRuntimeMarkPull(entry.channelId, accountId: entry.accountId, inboundCount: inboundCount)
+            })
+            gatewayChannelRuntimeTryDiagnostic({ =>
+                let pullMeta = gatewayLogMeta().string("channel", entry.channelId).string("accountId", entry.accountId)
+                    .string("phase", "pull").string("status", "ok").int("inboundCount", inboundCount).object()
+                if (inboundCount > 0) {
+                    gatewayLogEventInfo("gateway/channel/${entry.channelId}", "channel.pull", "channel pull completed", meta: pullMeta)
+                } else {
+                    gatewayLogEventDebug("gateway/channel/${entry.channelId}", "channel.pull", "channel pull completed", meta: pullMeta)
+                }
+            })
+            for (message in messages) {
+                try { handleInbound(message, entry.accountId) } catch (e: Exception) {
+                    this.markInboundFailure(entry.channelId, entry.accountId, e.message)
+                    gatewayChannelRuntimeTryDiagnostic({ =>
+                        gatewayLogEventError("gateway/channel/${entry.channelId}", "channel.failed", "channel inbound handler failed",
+                            meta: gatewayLogMeta().string("channel", channelToString(message.channel))
+                                .string("accountId", entry.accountId).string("phase", "inbound").string("status", "failed")
+                                .identityHash("peerHash", message.peerId).string("errorKind", "inbound_failed")
+                                .rawString("error", e.message).object())
+                    })
+                }
             }
         }
     }
 
     public func markInboundRejected(channelId: String, accountId: String, errorKind: String): Unit {
-        let _ = gatewayChannelRuntimeMarkInboundRejected(channelId, accountId: accountId, errorKind: errorKind)
+        let _ = gatewayChannelRuntimeTryObservationUpdate(channelId, accountId, { =>
+            gatewayChannelRuntimeMarkInboundRejected(channelId, accountId: accountId, errorKind: errorKind)
+        })
     }
 
     public func markInboundFailure(channelId: String, accountId: String, error: String): Unit {
@@ -1713,7 +1692,9 @@ public class GatewayChannelManager {
             state.connected = true
             state.lastError = error.trimAscii()
         })
-        let _ = gatewayChannelRuntimeMarkInboundFailure(channelId, accountId: accountId, error: error)
+        let _ = gatewayChannelRuntimeTryObservationUpdate(channelId, accountId, { =>
+            gatewayChannelRuntimeMarkInboundFailure(channelId, accountId: accountId, error: error)
+        })
     }
 
     public func sendToAdapterName(adapterName: String, outbound: OutboundMessage): GatewayChannelSendResult {
@@ -1740,42 +1721,50 @@ public class GatewayChannelManager {
                         state.connected = true
                         state.lastError = ""
                     })
-                    gatewayChannelRuntimeMarkSend(entry.channelId, accountId: entry.accountId, success: true)
-                    gatewayLogEventInfo(
-                        "gateway/channel/${entry.channelId}",
-                        "channel.send",
-                        "channel send completed",
-                        meta: gatewayLogMeta()
-                            .string("channel", entry.channelId)
-                            .string("accountId", entry.accountId)
-                            .string("phase", "send")
-                            .string("status", "ok")
-                            .identityHash("peerHash", outbound.peerId)
-                            .int("textLen", Int64(outbound.text.size))
-                            .object()
-                    )
+                    let _ = gatewayChannelRuntimeTryObservationUpdate(entry.channelId, entry.accountId, { =>
+                        gatewayChannelRuntimeMarkSend(entry.channelId, accountId: entry.accountId, success: true)
+                    })
+                    gatewayChannelRuntimeTryDiagnostic({ =>
+                        gatewayLogEventInfo(
+                            "gateway/channel/${entry.channelId}",
+                            "channel.send",
+                            "channel send completed",
+                            meta: gatewayLogMeta()
+                                .string("channel", entry.channelId)
+                                .string("accountId", entry.accountId)
+                                .string("phase", "send")
+                                .string("status", "ok")
+                                .identityHash("peerHash", outbound.peerId)
+                                .int("textLen", Int64(outbound.text.size))
+                                .object()
+                        )
+                    })
                     return GatewayChannelSendResult(true, rawAccountId: rawAccountId, canonicalAccountId: requiredAccountId)
                 case SendResult.Failed(reason) =>
                     let safeReason = gatewaySanitizeChannelDiagnostic(reason)
                     this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                         state.lastError = safeReason
                     })
-                    gatewayChannelRuntimeMarkSend(entry.channelId, accountId: entry.accountId, success: false, detail: safeReason)
-                    gatewayLogEventError(
-                        "gateway/channel/${entry.channelId}",
-                        "channel.failed",
-                        "channel send failed",
-                        meta: gatewayLogMeta()
-                            .string("channel", entry.channelId)
-                            .string("accountId", entry.accountId)
-                            .string("phase", "send")
-                            .string("status", "failed")
-                            .identityHash("peerHash", outbound.peerId)
-                            .int("textLen", Int64(outbound.text.size))
-                            .string("errorKind", "send_failed")
-                            .rawString("error", safeReason)
-                            .object()
-                    )
+                    let _ = gatewayChannelRuntimeTryObservationUpdate(entry.channelId, entry.accountId, { =>
+                        gatewayChannelRuntimeMarkSend(entry.channelId, accountId: entry.accountId, success: false, detail: safeReason)
+                    })
+                    gatewayChannelRuntimeTryDiagnostic({ =>
+                        gatewayLogEventError(
+                            "gateway/channel/${entry.channelId}",
+                            "channel.failed",
+                            "channel send failed",
+                            meta: gatewayLogMeta()
+                                .string("channel", entry.channelId)
+                                .string("accountId", entry.accountId)
+                                .string("phase", "send")
+                                .string("status", "failed")
+                                .identityHash("peerHash", outbound.peerId)
+                                .int("textLen", Int64(outbound.text.size))
+                                .string("errorKind", "send_failed")
+                                .rawString("error", safeReason)
+                                .object()
+                        )
+                    })
                     lastReason = "adapter send failed for channel='${normalized}' rawAccountId='${rawAccountId}' canonicalAccountId='${requiredAccountId}': ${safeReason}"
             }
         }
@@ -1815,21 +1804,25 @@ public class GatewayChannelManager {
                         state.connected = true
                         state.lastError = ""
                     })
-                    gatewayChannelRuntimeMarkSend(entry.channelId, accountId: entry.accountId, success: true)
-                    gatewayLogEventInfo(
-                        "gateway/channel/${entry.channelId}",
-                        "channel.send",
-                        "channel direct send completed",
-                        meta: gatewayLogMeta()
-                            .string("channel", entry.channelId)
-                            .string("accountId", entry.accountId)
-                            .string("phase", "send")
-                            .string("status", "ok")
-                            .identityHash("peerHash", outbound.peerId)
-                            .int("textLen", Int64(outbound.text.size))
-                            .string("messageId", sentMessageId)
-                            .object()
-                    )
+                    let _ = gatewayChannelRuntimeTryObservationUpdate(entry.channelId, entry.accountId, { =>
+                        gatewayChannelRuntimeMarkSend(entry.channelId, accountId: entry.accountId, success: true)
+                    })
+                    gatewayChannelRuntimeTryDiagnostic({ =>
+                        gatewayLogEventInfo(
+                            "gateway/channel/${entry.channelId}",
+                            "channel.send",
+                            "channel direct send completed",
+                            meta: gatewayLogMeta()
+                                .string("channel", entry.channelId)
+                                .string("accountId", entry.accountId)
+                                .string("phase", "send")
+                                .string("status", "ok")
+                                .identityHash("peerHash", outbound.peerId)
+                                .int("textLen", Int64(outbound.text.size))
+                                .string("messageId", sentMessageId)
+                                .object()
+                        )
+                    })
                     return GatewayChannelSendResult(
                         true,
                         messageId: sentMessageId,
@@ -1843,22 +1836,26 @@ public class GatewayChannelManager {
                 this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                     state.lastError = safeReason
                 })
-                gatewayChannelRuntimeMarkSend(entry.channelId, accountId: entry.accountId, success: false, detail: safeReason)
-                gatewayLogEventError(
-                    "gateway/channel/${entry.channelId}",
-                    "channel.failed",
-                    "channel direct send timed out",
-                    meta: gatewayLogMeta()
-                        .string("channel", entry.channelId)
-                        .string("accountId", entry.accountId)
-                        .string("phase", "send")
-                        .string("status", "failed")
-                        .identityHash("peerHash", outbound.peerId)
-                        .int("textLen", Int64(outbound.text.size))
-                        .string("errorKind", "send_timeout")
-                        .rawString("error", safeReason)
-                        .object()
-                )
+                let _ = gatewayChannelRuntimeTryObservationUpdate(entry.channelId, entry.accountId, { =>
+                    gatewayChannelRuntimeMarkSend(entry.channelId, accountId: entry.accountId, success: false, detail: safeReason)
+                })
+                gatewayChannelRuntimeTryDiagnostic({ =>
+                    gatewayLogEventError(
+                        "gateway/channel/${entry.channelId}",
+                        "channel.failed",
+                        "channel direct send timed out",
+                        meta: gatewayLogMeta()
+                            .string("channel", entry.channelId)
+                            .string("accountId", entry.accountId)
+                            .string("phase", "send")
+                            .string("status", "failed")
+                            .identityHash("peerHash", outbound.peerId)
+                            .int("textLen", Int64(outbound.text.size))
+                            .string("errorKind", "send_timeout")
+                            .rawString("error", safeReason)
+                            .object()
+                    )
+                })
                 return GatewayChannelSendResult(
                     false,
                     lastReason: "direct adapter send timed out for channel='${normalized}' rawAccountId='${rawAccountId}' canonicalAccountId='${requiredAccountId}': ${safeReason}",
@@ -1871,22 +1868,26 @@ public class GatewayChannelManager {
                 this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                     state.lastError = safeReason
                 })
-                gatewayChannelRuntimeMarkSend(entry.channelId, accountId: entry.accountId, success: false, detail: safeReason)
-                gatewayLogEventError(
-                    "gateway/channel/${entry.channelId}",
-                    "channel.failed",
-                    "channel direct send failed",
-                    meta: gatewayLogMeta()
-                        .string("channel", entry.channelId)
-                        .string("accountId", entry.accountId)
-                        .string("phase", "send")
-                        .string("status", "failed")
-                        .identityHash("peerHash", outbound.peerId)
-                        .int("textLen", Int64(outbound.text.size))
-                        .string("errorKind", "send_failed")
-                        .rawString("error", safeReason)
-                        .object()
-                )
+                let _ = gatewayChannelRuntimeTryObservationUpdate(entry.channelId, entry.accountId, { =>
+                    gatewayChannelRuntimeMarkSend(entry.channelId, accountId: entry.accountId, success: false, detail: safeReason)
+                })
+                gatewayChannelRuntimeTryDiagnostic({ =>
+                    gatewayLogEventError(
+                        "gateway/channel/${entry.channelId}",
+                        "channel.failed",
+                        "channel direct send failed",
+                        meta: gatewayLogMeta()
+                            .string("channel", entry.channelId)
+                            .string("accountId", entry.accountId)
+                            .string("phase", "send")
+                            .string("status", "failed")
+                            .identityHash("peerHash", outbound.peerId)
+                            .int("textLen", Int64(outbound.text.size))
+                            .string("errorKind", "send_failed")
+                            .rawString("error", safeReason)
+                            .object()
+                    )
+                })
                 return GatewayChannelSendResult(
                     false,
                     lastReason: "direct adapter send failed for channel='${normalized}' rawAccountId='${rawAccountId}' canonicalAccountId='${requiredAccountId}': ${safeReason}",

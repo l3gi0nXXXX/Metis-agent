@@ -4,7 +4,7 @@ import magic.jsonable.*
 
 import metis.core.config.CliConfig
 
-import std.collection.{ArrayList, HashSet}
+import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.fs.{File, Path, exists}
 import std.sync.Mutex
@@ -18,22 +18,134 @@ public func gatewayChannelRuntimeStatePath(): String {
     CliConfig.dotDir.join("gateway-channel-runtime-state.json").toString()
 }
 
+private class GatewayChannelRuntimePersistenceException <: Exception {
+    public let status: String
+    public init(status: String) {
+        super(status)
+        this.status = status
+    }
+}
+
+public class GatewayChannelRuntimeObservationResult {
+    public let persisted: Bool
+    public let status: String
+    public init(persisted: Bool, status: String) {
+        this.persisted = persisted
+        this.status = status
+    }
+}
+
+private var gatewayChannelRuntimeWriterForTest: Option<(Path, Array<Byte>) -> Unit> = None<(Path, Array<Byte>) -> Unit>
+private var gatewayChannelRuntimeDiagnosticForTest: Option<() -> Unit> = None<() -> Unit>
+private let gatewayChannelRuntimeObservationLock = Mutex()
+private let gatewayChannelRuntimeDegradedAccounts = HashMap<String, String>()
+
+public func setGatewayChannelRuntimeWriterForTest(writer: Option<(Path, Array<Byte>) -> Unit>): Unit {
+    gatewayChannelRuntimeWriterForTest = writer
+}
+
+public func setGatewayChannelRuntimeDiagnosticForTest(logger: Option<() -> Unit>): Unit {
+    gatewayChannelRuntimeDiagnosticForTest = logger
+}
+
+public func resetGatewayChannelRuntimeObservationForTest(): Unit {
+    gatewayChannelRuntimeWriterForTest = None<(Path, Array<Byte>) -> Unit>
+    gatewayChannelRuntimeDiagnosticForTest = None<() -> Unit>
+    synchronized(gatewayChannelRuntimeObservationLock) { gatewayChannelRuntimeDegradedAccounts.clear() }
+}
+
+// Diagnostic backends are observational too: a failed log must never become a failed turn.
+public func gatewayChannelRuntimeTryDiagnostic(log: () -> Unit): Unit {
+    try {
+        match (gatewayChannelRuntimeDiagnosticForTest) {
+            case Some(probe) => probe()
+            case None => ()
+        }
+        log()
+    } catch (_: Exception) { () }
+}
+
+public func gatewayChannelRuntimeReportPersistenceOutcome(
+    channelId: String, accountId: String, result: GatewayChannelRuntimeObservationResult
+): Unit {
+    let key = "${channelId}:${accountId}"
+    let emit = synchronized(gatewayChannelRuntimeObservationLock) {
+        if (result.persisted) {
+            gatewayChannelRuntimeDegradedAccounts.remove(key).isSome()
+        } else if (gatewayChannelRuntimeDegradedAccounts.contains(key)) {
+            false
+        } else if (gatewayChannelRuntimeDegradedAccounts.size < 128) {
+            gatewayChannelRuntimeDegradedAccounts.add(key, result.status)
+            true
+        } else { false }
+    }
+    if (emit) {
+        gatewayChannelRuntimeTryDiagnostic({ =>
+            let meta = gatewayLogMeta().string("channel", channelId).identityHash("accountHash", accountId)
+                .string("status", result.status).bool("persisted", result.persisted).object()
+            if (result.persisted) {
+                gatewayLogEventInfo("gateway/channel", "channel.runtime.persistence.recovered", "channel runtime persistence recovered", meta: meta)
+            } else {
+                gatewayLogEventWarn("gateway/channel", "channel.runtime.persistence.degraded", "channel runtime persistence unavailable", meta: meta)
+            }
+        })
+    }
+}
+
+public func gatewayChannelRuntimeTryObservationUpdate(
+    channelId: String, accountId: String, update: () -> JsonObject
+): GatewayChannelRuntimeObservationResult {
+    let result = try {
+        let _ = update()
+        GatewayChannelRuntimeObservationResult(true, "ok")
+    } catch (e: GatewayChannelRuntimePersistenceException) {
+        GatewayChannelRuntimeObservationResult(false, e.status)
+    } catch (_: Exception) {
+        GatewayChannelRuntimeObservationResult(false, "state_write_failed")
+    }
+    gatewayChannelRuntimeReportPersistenceOutcome(channelId, accountId, result)
+    result
+}
+
+// A read error is never an empty state: otherwise the next write would erase control truth.
 private func gatewayChannelRuntimeReadState(): JsonObject {
     let path = Path(gatewayChannelRuntimeStatePath())
-    if (!exists(path)) {
-        return JsonObject()
-    }
+    let bytes = try {
+        if (!exists(path)) { return JsonObject() }
+        File.readFrom(path)
+    } catch (_: Exception) { throw GatewayChannelRuntimePersistenceException("state_read_failed") }
+    let text = try { String.fromUtf8(bytes) }
+        catch (_: Exception) { throw GatewayChannelRuntimePersistenceException("invalid_response_encoding") }
     try {
-        JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
-    } catch (_e: Exception) {
-        JsonObject()
-    }
+        let root = JsonValue.fromStr(text).asObject()
+        match (root.get("accounts")) {
+            case Some(value) =>
+                let accounts = value.asArray()
+                for (i in 0..accounts.size()) {
+                    let row = accounts[i].asObject()
+                    // Reject damaged control values instead of silently defaulting them to permission to start.
+                    match (row.get("manualStop")) { case Some(v) => let _ = v.asBool() case None => () }
+                    for (key in ["restartBudget", "nextRestartAtMs"]) {
+                        match (row.get(key)) { case Some(v) => let _ = Int64.parse(v.toJsonString()) case None => () }
+                    }
+                }
+            case None => ()
+        }
+        root
+    } catch (_: Exception) { throw GatewayChannelRuntimePersistenceException("malformed_json") }
 }
 
 private func gatewayChannelRuntimeWriteState(root: JsonObject): Unit {
     let now = DateTime.now().toUnixTimeStamp().toMilliseconds()
     root.put("updatedAtMs", now.toJsonValue())
-    File.writeTo(Path(gatewayChannelRuntimeStatePath()), root.toJsonString().toArray())
+    try {
+        let path = Path(gatewayChannelRuntimeStatePath())
+        let bytes = root.toJsonString().toArray()
+        match (gatewayChannelRuntimeWriterForTest) {
+            case Some(writer) => writer(path, bytes)
+            case None => File.writeTo(path, bytes)
+        }
+    } catch (_: Exception) { throw GatewayChannelRuntimePersistenceException("state_write_failed") }
 }
 
 private func gatewayChannelRuntimeReadLocked<T>(reader: (JsonObject) -> T): T {
@@ -754,7 +866,7 @@ public func gatewayChannelRuntimeMarkMonitorTick(channelId: String, accountId!: 
 }
 
 public func gatewayChannelRuntimeCanStart(channelId: String, accountId!: String = "default"): Bool {
-    let accounts = gatewayChannelRuntimeAccountsJson(channelId)
+    let accounts = try { gatewayChannelRuntimeAccountsJson(channelId) } catch (_: Exception) { return false }
     let normalized = channelId.trimAscii().toAsciiLower()
     let normalizedAccount = gatewayCanonicalChannelAccountId(normalized, accountId)
     let now = gatewayChannelRuntimeNowMs()
