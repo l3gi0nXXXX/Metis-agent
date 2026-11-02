@@ -1,6 +1,7 @@
 package metis.process
 
 import std.env.getProcessId
+import std.time.MonoTime
 
 /** Bounded descriptor metadata only: never captures paths or socket peers. */
 public class ProcessFdSnapshot {
@@ -52,6 +53,16 @@ public func processFdSnapshotFromNativeResult(records: Array<UInt64>, returnedBy
     }
     ProcessFdSnapshot("ok", fdCount: count, fdLimit: fdLimit, vnodeCount: vnodes,
         socketCount: sockets, pipeCount: pipes, otherCount: others)
+}
+
+/** Classifies late observations without allocating a timeout worker or an extra descriptor. */
+public func captureCurrentProcessFdSnapshotUntil(deadline: MonoTime): ProcessFdSnapshot {
+    if (MonoTime.now() >= deadline) { return ProcessFdSnapshot("deadline_exceeded") }
+    let snapshot = captureCurrentProcessFdSnapshot()
+    if (MonoTime.now() >= deadline) {
+        return ProcessFdSnapshot("deadline_exceeded", fdLimit: snapshot.fdLimit)
+    }
+    snapshot
 }
 
 @When[os == "macOS"]

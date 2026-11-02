@@ -1,6 +1,6 @@
 package metis.gateway.core
 
-import metis.process.{ProcessFdSnapshot, captureCurrentProcessFdSnapshot}
+import metis.process.{ProcessFdSnapshot, captureCurrentProcessFdSnapshotUntil}
 import std.sync.Mutex
 import std.time.MonoTime
 import stdx.encoding.json.{JsonInt, JsonObject, JsonString}
@@ -27,7 +27,7 @@ public func gatewayObserveFdPressure(phase: String): JsonObject {
             let value = try {
                 match (gatewayFdObservationProvider) {
                     case Some(provider) => provider()
-                    case None => captureCurrentProcessFdSnapshot()
+                    case None => captureCurrentProcessFdSnapshotUntil(now + Duration.millisecond * 20)
                 }
             } catch (_: Exception) { ProcessFdSnapshot("probe_failed") }
             gatewayFdObservationDurationMs = max(0, (MonoTime.now() - now).toMilliseconds())
@@ -35,7 +35,7 @@ public func gatewayObserveFdPressure(phase: String): JsonObject {
             gatewayFdObservationSampledAt = now
         }
         let snapshot = gatewayFdObservationCached.getOrThrow()
-        let known = ["ok", "probe_failed", "invalid_native_result", "truncated", "unsupported"]
+        let known = ["ok", "probe_failed", "invalid_native_result", "truncated", "unsupported", "deadline_exceeded"]
         let status = if (known.contains(snapshot.status)) { snapshot.status } else { "probe_failed" }
         let out = JsonObject()
         out.put("phase", JsonString(if (["persist", "recovered", "heartbeat"].contains(phase)) { phase } else { "unknown" }))

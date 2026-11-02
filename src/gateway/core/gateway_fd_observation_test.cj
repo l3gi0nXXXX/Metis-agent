@@ -13,6 +13,19 @@ import stdx.encoding.json.JsonValue
 @Test
 public class GatewayFdObservationTest {
     @TestCase
+    public func fdS2B2DeadlineAndUnsupportedMetadataAreExplicit(): Unit {
+        for (status in ["deadline_exceeded", "unsupported"]) {
+            setGatewayFdSnapshotProviderForTest(Some({ => ProcessFdSnapshot(status, fdCount: 20, fdLimit: 64) }))
+            try {
+                let row = gatewayObserveFdPressure("persist")
+                @Expect(row.get("fdStatus").getOrThrow().asString().getValue(), status)
+                @Expect(row.get("fdCount").getOrThrow().asInt().getValue(), -1)
+                @Expect(row.get("fdLimit").getOrThrow().asInt().getValue(), 64)
+            } finally { setGatewayFdSnapshotProviderForTest(None) }
+        }
+    }
+
+    @TestCase
     public func fdS2P3PersistenceTransitionsCarryRegisteredFdEvidence(): Unit {
         let home = Directory.createTemp("/tmp")
         let keys = ["METIS_HOME", "METIS_LOG_FILE", "METIS_LOG_LEVEL", "METIS_CONSOLE_LEVEL"]
