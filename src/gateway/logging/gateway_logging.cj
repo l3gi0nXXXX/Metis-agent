@@ -9,6 +9,7 @@ import std.collection.ArrayList
 import std.env.getVariable
 import std.fs.{Directory, File, FileInfo, Path, exists}
 import std.regex.{Regex, RegexFlag}
+import std.sync.Mutex
 import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonFloat, JsonInt, JsonObject, JsonString, JsonValue}
 
@@ -23,6 +24,11 @@ public class MetisLogLevel {
 }
 
 public class MetisLogEvent {
+    public static const loggingFileRecovered: String = "logging.file.recovered"
+    public static const processFdObservation: String = "process.fd.observation"
+    public static const shellCommandFailed: String = "shell.command.failed"
+    public static const channelRuntimePersistenceDegraded: String = "channel.runtime.persistence.degraded"
+    public static const channelRuntimePersistenceRecovered: String = "channel.runtime.persistence.recovered"
     public static const gatewayRecoveryChecked: String = "gateway.recovery.checked"
     public static const gatewayRecoveryBlocked: String = "gateway.recovery.blocked"
     public static const gatewayRecoveryReconciled: String = "gateway.recovery.reconciled"
@@ -117,6 +123,7 @@ public class MetisLogEvent {
 
     public static func all(): Array<String> {
         [
+            loggingFileRecovered, processFdObservation, shellCommandFailed, channelRuntimePersistenceDegraded, channelRuntimePersistenceRecovered,
             gatewayRecoveryChecked, gatewayRecoveryBlocked, gatewayRecoveryReconciled,
             gatewayStarting, gatewayReady, gatewayShutdown, gatewayStopped, gatewayPollStale, gatewayPollRecovered,
             gatewayRuntimeStatePersistFailed, gatewayRuntimeStatePersistRecovered,
@@ -181,6 +188,8 @@ private var gatewayLoggingConsoleCaptureForTest: Option<ArrayList<String>> = Non
 private var gatewayLoggingFileSizeCachePath: String = ""
 private var gatewayLoggingFileSizeBytes: Int64 = 0
 private var gatewayLoggingFileSizeCapWarnedPath: String = ""
+private let gatewayLoggingFileWriteLock = Mutex()
+private var gatewayLoggingFailedRecords: Int64 = 0
 
 private func gatewayLogLevelRank(level: String): Int64 {
     match (level.trimAscii().toAsciiLower()) {
@@ -285,6 +294,7 @@ public func gatewayLoggingResetForTest(): Unit {
     gatewayLoggingFileSizeCachePath = ""
     gatewayLoggingFileSizeBytes = 0
     gatewayLoggingFileSizeCapWarnedPath = ""
+    synchronized(gatewayLoggingFileWriteLock) { gatewayLoggingFailedRecords = 0 }
 }
 
 public func gatewayLoggingCaptureConsoleForTest(): Unit {
@@ -551,34 +561,66 @@ public class MetisSubsystemLogger {
         }
     }
 
-    private func writeFile(settings: GatewayResolvedLoggingSettings, level: String, event: String, message: String, meta: JsonObject): Unit {
-        try {
-            let path = Path(settings.file)
-            if (!exists(path.parent)) {
-                Directory.create(path.parent, recursive: true)
-            }
-            let row = JsonObject()
-            row.put("time", JsonString(gatewayLoggingTimestamp()))
-            row.put("level", JsonString(level))
-            row.put("subsystem", JsonString(this.subsystem))
-            row.put("event", JsonString(if (gatewayLogEventIsKnown(event)) { event } else { MetisLogEvent.loggingRaw }))
-            row.put("message", JsonString(message))
-            for (key in meta.getFields().keys()) {
-                match (meta.get(key)) {
-                    case Some(value) => row.put(key, value)
-                    case None => ()
+    private func writeFile(settings: GatewayResolvedLoggingSettings, level: String, event: String, message: String,
+        meta: JsonObject): Unit {
+        synchronized(gatewayLoggingFileWriteLock) {
+            try {
+                let path = Path(settings.file)
+                if (!exists(path.parent)) {
+                    Directory.create(path.parent, recursive: true)
+                }
+                let row = JsonObject()
+                row.put("time", JsonString(gatewayLoggingTimestamp()))
+                row.put("level", JsonString(level))
+                row.put("subsystem", JsonString(this.subsystem))
+                row.put("event", JsonString(if (gatewayLogEventIsKnown(event)) {
+                    event
+                } else {
+                    MetisLogEvent.loggingRaw
+                }))
+                row.put("message", JsonString(message))
+                for (key in meta.getFields().keys()) {
+                    match (meta.get(key)) {
+                        case Some(value) => row.put(key, value)
+                        case None => ()
+                    }
+                }
+                let line = gatewayLoggingJsonLine(row)
+                let lineSize = Int64(line.toArray().size)
+                let nextSize = gatewayLoggingCachedFileSize(path) + lineSize
+                if (settings.maxFileBytes > 0 && nextSize > settings.maxFileBytes) {
+                    gatewayLoggingWriteSizeCapWarning(settings, path)
+                    return
+                }
+                if (gatewayLoggingFailedRecords > 0) {
+                    let recovered = JsonObject()
+                    recovered.put("time", JsonString(gatewayLoggingTimestamp()))
+                    recovered.put("level", JsonString(MetisLogLevel.warn))
+                    recovered.put("subsystem", JsonString("gateway/logging"))
+                    recovered.put("event", JsonString(MetisLogEvent.loggingFileRecovered))
+                    recovered.put("message", JsonString("file logging recovered"))
+                    recovered.put("failedRecords", JsonInt(gatewayLoggingFailedRecords))
+                    let summary = gatewayLoggingJsonLine(recovered)
+                    if (settings.maxFileBytes > 0 && nextSize + Int64(summary.toArray().size) > settings.maxFileBytes) {
+                        gatewayLoggingWriteSizeCapWarning(settings, path)
+                        return
+                    }
+                    if (!gatewayLoggingAppendFile(path, summary)) {
+                        if (gatewayLoggingFailedRecords < 1000000) {
+                            gatewayLoggingFailedRecords += 1
+                        }
+                        return
+                    }
+                    gatewayLoggingFailedRecords = 0
+                }
+                if (!gatewayLoggingAppendFile(path, line) && gatewayLoggingFailedRecords < 1000000) {
+                    gatewayLoggingFailedRecords += 1
+                }
+            } catch (_: Exception) {
+                if (gatewayLoggingFailedRecords < 1000000) {
+                    gatewayLoggingFailedRecords += 1
                 }
             }
-            let line = gatewayLoggingJsonLine(row)
-            let lineSize = Int64(line.toArray().size)
-            let nextSize = gatewayLoggingCachedFileSize(path) + lineSize
-            if (settings.maxFileBytes > 0 && nextSize > settings.maxFileBytes) {
-                gatewayLoggingWriteSizeCapWarning(settings, path)
-                return
-            }
-            _ = gatewayLoggingAppendFile(path, line)
-        } catch (_: Exception) {
-            ()
         }
     }
 

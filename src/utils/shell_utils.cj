@@ -21,7 +21,27 @@ public let SHELL_BROKER_CLEANUP_FAILED_DIAGNOSTIC: String = "broker_cleanup_fail
 public let SHELL_CAPTURE_OUTPUT_LIMIT_BYTES: Int64 = 4 * 1024 * 1024
 private let shellBrokerOwnerLock = Mutex()
 private var shellBrokerOwnerSequence: Int64 = 0
+private var shellCommandFailureReporter: ?((Int64, String) -> Unit) = None
 private var shellBrokerProviderForTest: Option<() -> ManagedStdioBrokerClient> = None<() -> ManagedStdioBrokerClient>
+
+/** Application composition installs this sink; process utilities do not depend on Gateway. */
+public func setShellCommandFailureReporter(reporter: ?((Int64, String) -> Unit)): ?((Int64, String) -> Unit) {
+    synchronized(shellBrokerOwnerLock) {
+        let previous = shellCommandFailureReporter
+        shellCommandFailureReporter = reporter
+        previous
+    }
+}
+
+private func reportShellCommandFailure(exitCode: Int64, kind: String): Unit {
+    let reporter = synchronized(shellBrokerOwnerLock) { shellCommandFailureReporter }
+    try {
+        match (reporter) {
+            case Some(value) => value(exitCode, kind)
+            case None => ()
+        }
+    } catch (_: Exception) { () }
+}
 
 private class ShellBrokerCaptureResult {
     public let status: String
@@ -246,8 +266,7 @@ public class ShellUtils {
                     ""
                 }
                 if (exitCode != 0 && logFailures) {
-                    LogUtils.error("Shell command execution failed: ${exitCode}")
-                    LogUtils.error("  ${cmd} ${String.join(cmdArgs, delimiter: ' ')}")
+                    reportShellCommandFailure(exitCode, "captured")
                 }
                 return (exitCode, stdout, stderr)
             case Some(_) => ()
@@ -261,7 +280,7 @@ public class ShellUtils {
             return (SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, "", SHELL_INVALID_RESPONSE_ENCODING_DIAGNOSTIC)
         }
         if (result.exitCode != 0 && logFailures) {
-            LogUtils.error("Shell command execution failed: ${result.exitCode}")
+            reportShellCommandFailure(result.exitCode, "timed")
         }
         (result.exitCode, result.stdout, result.stderr)
     }
