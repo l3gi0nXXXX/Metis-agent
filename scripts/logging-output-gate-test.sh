@@ -40,11 +40,28 @@ cat > "$TMP_ROOT/scripts/openclaw-compat-capabilities.mjs" <<'FIXTURE'
 process.stdout.write(`${JSON.stringify({ ok: true })}\n`);
 FIXTURE
 
+# The gate checks these fixtures' exact protocol/diagnostic sinks as well.
+# Copy source for static scanning only; this self-test never starts a service.
+for fixture in \
+  gateway-historical-recovery-broker-nonzero.mjs \
+  metis-gateway-stop-fake-service-plugin.mjs \
+  metis-s5-broker-writer-failure-proxy.mjs; do
+  cp "$ROOT_DIR/scripts/$fixture" "$TMP_ROOT/scripts/$fixture"
+done
+
 "$GATE" --root "$TMP_ROOT" > "$TMP_ROOT/pass.out"
 rg -q "logging-output-gate: passed" "$TMP_ROOT/pass.out"
 rg -q "Gateway LogUtils: allowed=0 disallowed=0" "$TMP_ROOT/pass.out"
 rg -q "Gateway direct toJsonString output: allowed=1 disallowed=0" "$TMP_ROOT/pass.out"
-rg -q "JS stdout protocol/report: allowed=2 disallowed=0" "$TMP_ROOT/pass.out"
+rg -q "JS stdout protocol/report: allowed=4 disallowed=0" "$TMP_ROOT/pass.out"
+
+printf '\nprocess.stdout.write("polluted\\n");\n' >> "$TMP_ROOT/scripts/gateway-historical-recovery-broker-nonzero.mjs"
+if "$GATE" --root "$TMP_ROOT" > "$TMP_ROOT/fail-history.out" 2>&1; then
+  echo "logging-output-gate-test: expected gate failure for historical fixture stdout" >&2
+  exit 1
+fi
+rg -q "Historical recovery fixture direct stdout write count: expected=0 actual=1" "$TMP_ROOT/fail-history.out"
+cp "$ROOT_DIR/scripts/gateway-historical-recovery-broker-nonzero.mjs" "$TMP_ROOT/scripts/gateway-historical-recovery-broker-nonzero.mjs"
 
 cat > "$TMP_ROOT/src/gateway/core/new_runtime_output.cj" <<'FIXTURE'
 func fixtureDisallowed() {
