@@ -19,6 +19,7 @@ import metis.gateway.core.{
     gatewayChannelRuntimeMarkFailure,
     gatewayChannelRuntimeMarkRunning,
     gatewayChannelRuntimeMarkSend,
+    gatewayChannelRuntimeTryObservationUpdate,
     gatewayChannelRuntimeMarkStarting,
     gatewayChannelRuntimeMarkStopped,
     gatewayCanonicalChannelAccountId,
@@ -2025,12 +2026,26 @@ private func gatewayPluginSendJson(user: GatewayUserSettings, pluginId: String, 
         accountId: accountId
     )
     let ok = gatewayJsonBool(host, "ok", false)
-    let runtime = gatewayChannelRuntimeMarkSend(
-        normalized,
-        accountId: accountId,
-        success: ok,
-        detail: gatewayBindingStringParam(host, ["reason", "hostError", "error"], "send-failed")
-    )
+    let runtimeRows = ArrayList<JsonObject>()
+    let observation = gatewayChannelRuntimeTryObservationUpdate(normalized, accountId, { =>
+        let row = gatewayChannelRuntimeMarkSend(
+            normalized,
+            accountId: accountId,
+            success: ok,
+            detail: gatewayBindingStringParam(host, ["reason", "hostError", "error"], "send-failed")
+        )
+        runtimeRows.add(row)
+        row
+    })
+    let runtime = if (runtimeRows.isEmpty()) { JsonObject() } else { runtimeRows[0] }
+    runtime.put("persisted", observation.persisted.toJsonValue())
+    runtime.put("persistenceStatus", JsonString(observation.status))
+    let manager = try { gatewayPluginManagerSummary(normalized) }
+        catch (_: Exception) {
+            let unavailable = JsonObject()
+            unavailable.put("status", JsonString("state_read_failed"))
+            unavailable
+        }
     result.put("accountId", JsonString(accountId))
     result.put("peerId", JsonString(peerId))
     policyDelivery.put("deliverable", ok.toJsonValue())
@@ -2038,7 +2053,7 @@ private func gatewayPluginSendJson(user: GatewayUserSettings, pluginId: String, 
     result.put("ok", ok.toJsonValue())
     result.put("host", host)
     result.put("runtime", runtime)
-    result.put("manager", gatewayPluginManagerSummary(normalized))
+    result.put("manager", manager)
     result
 }
 

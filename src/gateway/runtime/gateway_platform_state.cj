@@ -5,7 +5,8 @@ import magic.jsonable.*
 import metis.core.config.CliConfig
 import metis.core.config.CliSettingManager
 import metis.gateway.config.buildGatewayConfigFromUserSettings
-import metis.gateway.core.{gatewayLogEventInfo, gatewayLogMeta}
+import metis.gateway.core.{gatewayLogEventInfo, gatewayLogMeta, GatewayChannelRuntimeObservationResult,
+    gatewayChannelRuntimeReportPersistenceOutcome}
 import metis.gateway.model.GatewayConfig
 
 import std.convert.Parsable
@@ -296,8 +297,8 @@ private func gatewayPushPhase(lifecycleState: String, status: String): String {
     return "queued"
 }
 
-private func makeNodesJson(cfg: GatewayConfig, running: Bool): JsonObject {
-    let registry = gatewayNodeRegistrySnapshot(cfg, running)
+private func makeNodesJson(cfg: GatewayConfig, running: Bool, previous!: ?JsonObject = None): JsonObject {
+    let registry = gatewayNodeRegistrySnapshot(cfg, running, previous: previous)
     match (registry.get("nodes")) {
         case Some(v) =>
             try { return v.asObject() } catch (_e: Exception) { () }
@@ -323,8 +324,8 @@ private func makeNodesJson(cfg: GatewayConfig, running: Bool): JsonObject {
     root
 }
 
-private func makeDevicesJson(cfg: GatewayConfig): JsonObject {
-    let existing = readPlatformState()
+private func makeDevicesJson(cfg: GatewayConfig, previous!: ?JsonObject = None): JsonObject {
+    let existing = previous ?? readPlatformState()
     match (existing.get("devices")) {
         case Some(v) =>
             try { return v.asObject() } catch (_e: Exception) { () }
@@ -453,12 +454,13 @@ private func makeTalkJson(cfg: GatewayConfig): JsonObject {
     root
 }
 
-private func buildPlatformState(cfg: GatewayConfig, running: Bool): JsonObject {
+private func buildPlatformState(cfg: GatewayConfig, running: Bool,
+    previousNodes!: ?JsonObject = None, previousPlatform!: ?JsonObject = None): JsonObject {
     let root = JsonObject()
     root.put("running", running.toJsonValue())
     root.put("updatedAtMs", nowMs().toJsonValue())
-    root.put("nodes", makeNodesJson(cfg, running))
-    root.put("devices", makeDevicesJson(cfg))
+    root.put("nodes", makeNodesJson(cfg, running, previous: previousNodes))
+    root.put("devices", makeDevicesJson(cfg, previous: previousPlatform))
     root.put("push", makePushJson(cfg))
     root.put("usage", makeUsageJson())
     root.put("secrets", makeSecretsJson(cfg))
@@ -467,8 +469,8 @@ private func buildPlatformState(cfg: GatewayConfig, running: Bool): JsonObject {
     root
 }
 
-public func gatewayNodeRegistrySnapshot(cfg: GatewayConfig, running: Bool): JsonObject {
-    let root = readJsonObjectFile(gatewayNodeRegistryPath())
+public func gatewayNodeRegistrySnapshot(cfg: GatewayConfig, running: Bool, previous!: ?JsonObject = None): JsonObject {
+    let root = previous ?? readJsonObjectFile(gatewayNodeRegistryPath())
     match (root.get("nodes")) {
         case Some(_) => return root
         case None => ()
@@ -501,9 +503,11 @@ public func gatewayRegisterOrHeartbeatNode(
     running!: Bool = true,
     kind!: String = "local",
     status!: String = "online",
-    lifecycleState!: String = "running"
+    lifecycleState!: String = "running",
+    previous!: ?JsonObject = None,
+    persist!: Bool = true
 ): JsonObject {
-    let snapshot = gatewayNodeRegistrySnapshot(cfg, running)
+    let snapshot = gatewayNodeRegistrySnapshot(cfg, running, previous: previous)
     let nodes = match (snapshot.get("nodes")) {
         case Some(v) =>
             try { v.asObject() } catch (_e: Exception) { JsonObject() }
@@ -618,7 +622,9 @@ public func gatewayRegisterOrHeartbeatNode(
     let out = JsonObject()
     out.put("updatedAtMs", nowMs().toJsonValue())
     out.put("nodes", nodesOut)
-    writeJsonObjectFile(gatewayNodeRegistryPath(), out)
+    if (persist) {
+        writeJsonObjectFile(gatewayNodeRegistryPath(), out)
+    }
     out
 }
 
@@ -3252,52 +3258,114 @@ public func gatewayPlatformMarkRunning(cfg: GatewayConfig): Unit {
 }
 
 public func gatewayPlatformHeartbeat(cfg: GatewayConfig): Unit {
-    let nodeState = gatewayRegisterOrHeartbeatNode(cfg, localNodeId(), running: true, status: "online", lifecycleState: "running")
-    writeJsonObjectFile(gatewayNodeRegistryPath(), nodeState)
-    let platform = buildPlatformState(cfg, true)
-    writePlatformState(platform)
+    let _ = gatewayPlatformTryHeartbeat(cfg)
+}
+
+private class GatewayPlatformHeartbeatReadException <: Exception {
+    public let status: String
+    public init(status: String) { super(status); this.status = status }
+}
+
+private var gatewayPlatformHeartbeatWriterForTest: ?((Path, Array<Byte>) -> Unit) = None
+
+public func setGatewayPlatformHeartbeatWriterForTest(writer: ?((Path, Array<Byte>) -> Unit)): Unit {
+    gatewayPlatformHeartbeatWriterForTest = writer
+}
+
+private func gatewayPlatformReadHeartbeatState(path: String, node: Bool): JsonObject {
+    let bytes = try {
+        if (!exists(Path(path))) { return JsonObject() }
+        File.readFrom(Path(path))
+    } catch (_: Exception) { throw GatewayPlatformHeartbeatReadException("state_read_failed") }
+    let text = try { String.fromUtf8(bytes) }
+        catch (_: Exception) { throw GatewayPlatformHeartbeatReadException("invalid_response_encoding") }
     try {
-        let nodeBytes = File.readFrom(Path(gatewayNodeRegistryPath())).size
-        let platformBytes = File.readFrom(Path(gatewayPlatformStatePath())).size
-        let nodesRoot = try {
-            (nodeState.get("nodes") ?? JsonObject()).asObject()
-        } catch (_e: Exception) {
-            JsonObject()
-        }
-        let items = try {
-            (nodesRoot.get("items") ?? JsonArray([])).asArray()
-        } catch (_e: Exception) {
-            JsonArray([])
-        }
-        if (items.size() > 0) {
-            let node = try {
-                items[0].asObject()
+        let root = JsonValue.fromStr(text).asObject()
+        if (node) {
+            if (let Some(value) <- root.get("nodes")) {
+                let nodes = value.asObject()
+                if (let Some(items) <- nodes.get("items")) {
+                    let rows = items.asArray()
+                    for (index in 0..rows.size()) { let _ = rows[index].asObject() }
+                }
+            }
+        } else if (let Some(value) <- root.get("devices")) { let _ = value.asObject() }
+        root
+    } catch (_: Exception) { throw GatewayPlatformHeartbeatReadException("malformed_json") }
+}
+
+private func gatewayPlatformWriteHeartbeatState(path: String, value: JsonObject): Unit {
+    let bytes = value.toJsonString().toArray()
+    match (gatewayPlatformHeartbeatWriterForTest) {
+        case Some(writer) => writer(Path(path), bytes)
+        case None => File.writeTo(Path(path), bytes)
+    }
+}
+
+/** Heartbeats are observation; failed reads must never become an empty replacement state. */
+public func gatewayPlatformTryHeartbeat(cfg: GatewayConfig): GatewayChannelRuntimeObservationResult {
+    let outcome = try {
+        let previousNodes = gatewayPlatformReadHeartbeatState(gatewayNodeRegistryPath(), true)
+        let previousPlatform = gatewayPlatformReadHeartbeatState(gatewayPlatformStatePath(), false)
+        let nodeState = gatewayRegisterOrHeartbeatNode(cfg, localNodeId(), running: true, status: "online",
+            lifecycleState: "running", previous: Some(previousNodes), persist: false)
+        let platform = buildPlatformState(cfg, true, previousNodes: Some(nodeState),
+            previousPlatform: Some(previousPlatform))
+        gatewayPlatformWriteHeartbeatState(gatewayNodeRegistryPath(), nodeState)
+        gatewayPlatformWriteHeartbeatState(gatewayPlatformStatePath(), platform)
+        try {
+            let nodeBytes = File.readFrom(Path(gatewayNodeRegistryPath())).size
+            let platformBytes = File.readFrom(Path(gatewayPlatformStatePath())).size
+            let nodesRoot = try {
+                (nodeState.get("nodes") ?? JsonObject()).asObject()
             } catch (_e: Exception) {
                 JsonObject()
             }
-            let heartbeatCount = readJsonInt(node, "heartbeatCount", 0)
-            let lifecycleHistory = match (node.get("lifecycleHistory")) {
-                case Some(v) =>
-                    try { v.asArray() } catch (_e: Exception) { JsonArray([]) }
-                case None => JsonArray([])
+            let items = try {
+                (nodesRoot.get("items") ?? JsonArray([])).asArray()
+            } catch (_e: Exception) {
+                JsonArray([])
             }
-            if (heartbeatCount == 1 || heartbeatCount % 100 == 0) {
-                gatewayLogEventInfo(
-                    "gateway/platform",
-                    "gateway.ready",
-                    "platform heartbeat persisted",
-                    meta: gatewayLogMeta()
-                        .int("nodeBytes", nodeBytes)
-                        .int("platformBytes", platformBytes)
-                        .int("heartbeatCount", heartbeatCount)
-                        .int("lifecycleHistorySize", lifecycleHistory.size())
-                        .object()
-                )
+            if (items.size() > 0) {
+                let node = try {
+                    items[0].asObject()
+                } catch (_e: Exception) {
+                    JsonObject()
+                }
+                let heartbeatCount = readJsonInt(node, "heartbeatCount", 0)
+                let lifecycleHistory = match (node.get("lifecycleHistory")) {
+                    case Some(v) => try {
+                        v.asArray()
+                    } catch (_e: Exception) {
+                        JsonArray([])
+                    }
+                    case None => JsonArray([])
+                }
+                if (heartbeatCount == 1 || heartbeatCount % 100 == 0) {
+                    gatewayLogEventInfo(
+                        "gateway/platform",
+                        "gateway.ready",
+                        "platform heartbeat persisted",
+                        meta: gatewayLogMeta()
+                            .int("nodeBytes", nodeBytes)
+                            .int("platformBytes", platformBytes)
+                            .int("heartbeatCount", heartbeatCount)
+                            .int("lifecycleHistorySize", lifecycleHistory.size())
+                            .object()
+                    )
+                }
             }
+        } catch (_e: Exception) {
+            ()
         }
-    } catch (_e: Exception) {
-        ()
+        GatewayChannelRuntimeObservationResult(true, "ok")
+    } catch (e: GatewayPlatformHeartbeatReadException) {
+        GatewayChannelRuntimeObservationResult(false, e.status)
+    } catch (_: Exception) {
+        GatewayChannelRuntimeObservationResult(false, "state_write_failed")
     }
+    gatewayChannelRuntimeReportPersistenceOutcome("platform", localNodeId(), outcome)
+    outcome
 }
 
 public func gatewayPlatformMarkStopped(cfg: GatewayConfig): Unit {
