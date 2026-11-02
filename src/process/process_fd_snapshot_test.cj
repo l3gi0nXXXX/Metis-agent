@@ -6,6 +6,7 @@ import std.collection.{ArrayList, HashMap}
 import std.env.{getCommand, getVariable, getVariables}
 import std.fs.{Directory, File, Path, remove}
 import std.process.{launch, ProcessRedirect}
+import std.time.MonoTime
 import std.unittest.testmacro.*
 
 @When[os == "macOS"]
@@ -15,6 +16,18 @@ foreign {
 
 @Test
 public class ProcessFdSnapshotTest {
+    @TestCase
+    public func fdS2B2ExpiredObservationDeadlineStaysUnknown(): Unit {
+        let value = captureCurrentProcessFdSnapshotUntil(MonoTime.now() - Duration.millisecond)
+        @Expect(value.status, "deadline_exceeded")
+        @Expect(value.fdCount, -1)
+        @Expect(value.fdLimit, -1)
+        @Expect(value.vnodeCount, -1)
+        @Expect(value.socketCount, -1)
+        @Expect(value.pipeCount, -1)
+        @Expect(value.otherCount, -1)
+    }
+
     @TestCase
     public func fdS2U1NativeLayoutCountsOnlyDescriptorKinds(): Unit {
         let rows: Array<UInt64> = [UInt64(1) << 32, UInt64(2) << 32, UInt64(6) << 32,
