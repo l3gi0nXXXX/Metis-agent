@@ -237,6 +237,13 @@ class ReleaseManager:
             self.print_error(f"Binary not found: {binary_path}")
             return False
 
+        runtime_archive = binary_path.parent / f"magic-cli-{self.platform}-runtime.tar.gz"
+        if self.platform.startswith("macos-") and (
+            not runtime_archive.is_file() or runtime_archive.is_symlink()
+        ):
+            self.print_error("Managed Darwin runtime archive is missing or invalid")
+            return False
+
         exit_code, stdout, stderr = self.run_command([
             "python3", str(gitcode_script), "upload",
             "--owner", self.owner,
@@ -248,6 +255,16 @@ class ReleaseManager:
         ])
 
         if exit_code == 0:
+            if self.platform.startswith("macos-"):
+                archive_code, _, _ = self.run_command([
+                    "python3", str(gitcode_script), "upload",
+                    "--owner", self.owner, "--repo", self.repo,
+                    "--tag", self.tag, "--access-token", self.access_token,
+                    str(runtime_archive), "--remote-name", runtime_archive.name
+                ])
+                if archive_code != 0:
+                    self.print_error("Managed Darwin runtime archive upload failed")
+                    return False
             print()
             self.print_header("✅ Release Process Completed!")
             print(f"{Colors.GREEN}🎉 Magic CLI {self.tag} has been released for {self.platform}!{Colors.NC}")

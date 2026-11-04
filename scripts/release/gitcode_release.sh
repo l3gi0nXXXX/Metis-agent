@@ -169,6 +169,16 @@ echo ""
 print_step "Step 3: Uploading binary for ${CYAN}${PLATFORM}${NC}"
 echo ""
 
+runtime_archive="./binary/magic-cli-$PLATFORM-runtime.tar.gz"
+case "$PLATFORM" in
+    macos-*)
+        if [ ! -f "$runtime_archive" ] || [ -L "$runtime_archive" ]; then
+            print_error "Managed Darwin runtime archive is missing or invalid"
+            exit 1
+        fi
+        ;;
+esac
+
 python3 "$SCRIPT_DIR/gitcode.py" upload \
     --owner "$OWNER" \
     --repo "$REPO" \
@@ -178,6 +188,17 @@ python3 "$SCRIPT_DIR/gitcode.py" upload \
     --remote-name "magic-cli-$PLATFORM"
 
 if [ $? -eq 0 ]; then
+    case "$PLATFORM" in
+        macos-*)
+            if ! python3 "$SCRIPT_DIR/gitcode.py" upload \
+                --owner "$OWNER" --repo "$REPO" --tag "$TAG" \
+                --access-token "$ACCESS_TOKEN" "$runtime_archive" \
+                --remote-name "magic-cli-$PLATFORM-runtime.tar.gz"; then
+                print_error "Managed Darwin runtime archive upload failed"
+                exit 1
+            fi
+            ;;
+    esac
     print_success "Binary uploaded successfully!"
     echo ""
     print_header "✅ Release Process Completed!"
