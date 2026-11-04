@@ -1,13 +1,13 @@
 package metis.process
 
 import std.collection.{ArrayList, HashMap, Map}
-import std.env.{getCommand, getProcessId, getVariable, getVariables, setVariable}
+import std.env.{getCommand, getProcessId, getVariable, getVariables, setVariable, removeVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.io.InputStream
 import std.convert.Parsable
 import std.posix.chmod
 import std.process.{ProcessRedirect, executeWithOutput}
-import std.runtime.{gc, getGCCount}
+import std.runtime.{gc, getGCCount, getThreadCount, getBlockingThreadCount}
 import std.time.{DateTime, MonoTime}
 import std.unittest.testmacro.*
 
@@ -635,6 +635,18 @@ public class ManagedOwnedChildTest {
         })
     }
 
+    @TestCase
+    public func rS1LB3LateWaitAfterNativeReapAndRootCompaction(): Unit {
+        for (code in [0, 7]) { ownedLateWaitScenario("positive", code) }
+    }
+
+    @TestCase
+    public func rS1LN3CompactedWaitKeepsBindingCheckpointAndExecErrorsStrict(): Unit {
+        for (mode in ["binding", "checkpoint", "source-spawned", "source-terminal", "exec-error"]) {
+            ownedLateWaitScenario(mode, 7)
+        }
+    }
+
 }
 
 @When[os == "macOS"]
@@ -704,4 +716,354 @@ private func ownedTestNativeCapture(command: String, args: Array<String>, enviro
     if (ownedTestFdCount() != baseline) { println("native_compat_fd_mismatch before=${baselineDescriptors} after=${ownedTestFdSummary()}") }
     @Expect(ownedTestFdCount(), baseline)
     result
+}
+
+@When[os == "macOS"]
+private func ownedLateWaitStrictCheck(value: Bool): Unit {
+    @Expect(value, true)
+    if (!value) { throw Exception("owned_late_wait_contract_failed") }
+}
+
+@When[os == "macOS"]
+private func ownedLateWaitReadText(path: Path): String {
+    match (managedRecoveryReadText(path)) {
+        case Some(value) => value
+        case None => throw Exception("owned_late_wait_metadata_invalid")
+    }
+}
+
+@When[os == "macOS"]
+private func ownedLateWaitAwaitTerminal(child: ManagedOwnedChild, directory: Path, key: String,
+    spawned: String, helperBirth: ProcessBirthIdentity, ownerBirth: ProcessBirthIdentity,
+    ownerPgid: Int64, deadline: MonoTime): Unit {
+    while (MonoTime.now() < deadline) {
+        // On macOS this is a real waitpid(WNOHANG) reap in the underlying native
+        // handle. It deliberately does not call/cache ManagedRecoveryChild.wait.
+        if (!child.isAlive() && exists(directory.join("${key}.terminal"))) {
+            ownedLateWaitStrictCheck(ownedLateWaitReadText(directory.join("${key}.terminal")) ==
+                spawned.replace("phase:spawned\n", "phase:terminal\n"))
+            let helper = probeProcessBirthIdentity(helperBirth, deadline)
+            let owner = probeProcessBirthIdentity(ownerBirth, deadline)
+            let groupGone = unsafe { kill(-Int32(ownerPgid), 0) } != 0 && unsafe { __error().read() } == 3
+            if (helper.conclusive && helper.status == "gone" && !helper.alive &&
+                owner.conclusive && owner.status == "gone" && !owner.alive && groupGone) { return }
+        }
+        sleep(Duration.millisecond * 5)
+    }
+    throw Exception("owned_late_wait_terminal_timeout")
+}
+
+@When[os == "macOS"]
+private func ownedLateWaitScenario(mode: String, expectedCode: Int64): Unit {
+    let nonce = "late-wait-${getProcessId()}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+    let home = Directory.createTemp("/private/tmp")
+    let directory = home.join("inventory")
+    let parent = currentProcessInstanceIdentity().getOrThrow().serialize()
+    let context = (directory.toString(), parent)
+    let previousDirectory = getVariable("METIS_PROCESS_RECOVERY_DIRECTORY")
+    let previousParent = getVariable("METIS_PROCESS_RECOVERY_PARENT")
+    let handles = ArrayList<ManagedOwnedChild>()
+    let hasB = mode != "source-spawned" && mode != "source-terminal"
+    let execErrorCase = mode == "exec-error"
+    var initialized = false
+    var launchPending = false
+    var nativeReaped = false
+    var compactedBeforeWait = false
+    var negativeRejected = false
+    var wrapperWaited = false
+    var cachedCode: Int64 = -1
+    var bWaited = false
+    var formal = false
+    var proofSaved = false
+    var cleanupTerminal = false
+    var finalSource = false
+    var finalResources = false
+    var baselineFd: Int64 = -1
+    var baselineTasks: Int64 = -1
+    var baselineBlocking: Int64 = -1
+    var finalFd: Int64 = -1
+    var finalTasks: Int64 = -1
+    var finalBlocking: Int64 = -1
+    var restoreMutation = None<(Path, Array<Byte>)>
+    var failure = None<Exception>
+    var step = "initialize"
+    try {
+        File.writeTo(home.join("owned.owner"),
+            "metis-owned-late-wait-v1\nnonce:${nonce}\ntestPid:${getProcessId()}\nmode:${mode}\n".toArray())
+        println("owned_late_wait_evidence basename=${home.fileName}")
+        ownedLateWaitStrictCheck(managedRecoveryInitialize(directory, parent, nonce))
+        initialized = true
+        baselineFd = ownedTestFdCount()
+        baselineTasks = getThreadCount()
+        baselineBlocking = getBlockingThreadCount()
+        let environment = HashMap<String, String>(getVariables())
+        for (name in ["HOME", "TMPDIR", "METIS_HOME"]) { environment[name] = home.toString() }
+        for (name in ["NODE_OPTIONS", "BASH_ENV", "ENV"]) { environment.remove(name) }
+        let script = "IFS= read -r released || exit 64; [ \"$released\" = release ] || exit 65; " +
+            "printf '迟等中文😀\\000\\377'; printf '错误😀\\376' >&2; exit ${expectedCode}"
+        File.writeTo(home.join("a.script.input"), script.toArray())
+        step = "launch-a"
+        launchPending = true
+        let a = managedRecoveryLaunchInContext(context,
+            if (execErrorCase) { home.join("missing-command").toString() } else { "/bin/sh" },
+            if (execErrorCase) { Array<String>() } else { ["-c", script] }, None,
+            Some<Map<String, String>>(environment),
+            if (execErrorCase) { ProcessRedirect.Discard } else { ProcessRedirect.Pipe },
+            ProcessRedirect.Pipe, ProcessRedirect.Pipe)
+        handles.add(a)
+        launchPending = false
+        ownedLateWaitStrictCheck(managedRecoveryReadIssued(directory, parent) == 1)
+        let key = "r-1"
+        let ownerKey = "${key}-o-1"
+        let spawned = ownedLateWaitReadText(directory.join("${key}.spawned"))
+        let helperFields = managedRecoveryParseFields(spawned).getOrThrow()
+        ownedLateWaitStrictCheck(helperFields["key"] == key && helperFields["parent"] == parent &&
+            Int64.parse(helperFields["pid"]) == a.pid && helperFields["pgid"] == "0")
+        ownedLateWaitStrictCheck(spawned ==
+            "managed-recovery-v1\nkey:${key}\nphase:spawned\nparent:${parent}\npid:${a.pid}\npgid:0\nbirth:\n")
+        let helperBirthText = ownedLateWaitReadText(directory.join("${key}.birth"))
+        let helperBorn = managedRecoveryParseFields(helperBirthText).getOrThrow()
+        let helperBirth = parseProcessBirthIdentity(helperBorn["birth"]).getOrThrow()
+        ownedLateWaitStrictCheck(helperBirth.pid == a.pid && helperBirthText ==
+            "managed-recovery-v1\nkey:${key}\nphase:birth\nparent:${parent}\npid:${a.pid}\npgid:0\nbirth:${helperBirth.serialize()}\n")
+        let ownerSpawned = ownedLateWaitReadText(directory.join("${ownerKey}.spawned"))
+        let ownerFields = managedRecoveryParseFields(ownerSpawned).getOrThrow()
+        let ownerPid = Int64.parse(ownerFields["pid"])
+        let ownerPgid = Int64.parse(ownerFields["pgid"])
+        ownedLateWaitStrictCheck(ownerPid > 1 && ownerPid <= 2147483647 && ownerPgid == ownerPid &&
+            ownerFields["key"] == ownerKey && ownerFields["parent"] == parent)
+        ownedLateWaitStrictCheck(ownerSpawned ==
+            "managed-recovery-v1\nkey:${ownerKey}\nphase:spawned\nparent:${parent}\npid:${ownerPid}\npgid:${ownerPgid}\nbirth:\n")
+        let ownerBirthText = ownedLateWaitReadText(directory.join("${ownerKey}.birth"))
+        let ownerBorn = managedRecoveryParseFields(ownerBirthText).getOrThrow()
+        let ownerBirth = parseProcessBirthIdentity(ownerBorn["birth"]).getOrThrow()
+        ownedLateWaitStrictCheck(ownerBirth.pid == ownerPid && ownerBirthText ==
+            "managed-recovery-v1\nkey:${ownerKey}\nphase:birth\nparent:${parent}\npid:${ownerPid}\npgid:${ownerPgid}\nbirth:${ownerBirth.serialize()}\n")
+        // The builtin-read barrier leaves both real births available before the
+        // successful owner is compacted by the attached broker's own publisher.
+        for (entry in Directory.readFrom(directory)) {
+            ownedLateWaitStrictCheck(entry.isRegular() && !entry.isSymbolicLink() && entry.size <= 16384)
+            File.writeTo(home.join("original-${entry.name}"), File.readFrom(entry.path))
+        }
+        if (!execErrorCase) {
+            ownedLateWaitStrictCheck(Int64(unsafe { getpgid(Int32(ownerPid)) }) == ownerPgid)
+            a.stdInPipe.write("release\n".toArray())
+            a.closeInput()
+        }
+        step = "native-reap-before-wrapper-wait"
+        ownedLateWaitAwaitTerminal(a, directory, key, spawned, helperBirth, ownerBirth,
+            ownerPgid, MonoTime.now() + Duration.second * 5)
+        nativeReaped = true
+        for (entry in Directory.readFrom(directory)) {
+            ownedLateWaitStrictCheck(entry.isRegular() && !entry.isSymbolicLink() && entry.size <= 16384)
+            File.writeTo(home.join("terminal-${entry.name}"), File.readFrom(entry.path))
+        }
+        let rawOut = ownedTestReadAll(a.stdOutPipe)
+        let rawErr = ownedTestReadAll(a.stdErrPipe)
+        File.writeTo(home.join("a.stdout.bin"), rawOut)
+        File.writeTo(home.join("a.stderr.bin"), rawErr)
+        let expectedOut = ArrayList<Byte>()
+        let expectedErr = ArrayList<Byte>()
+        if (!execErrorCase) {
+            expectedOut.add(all: "迟等中文😀".toArray()); expectedOut.add(all: [0u8, 0xffu8])
+            expectedErr.add(all: "错误😀".toArray()); expectedErr.add(0xfeu8)
+        }
+        ownedLateWaitStrictCheck(rawOut == expectedOut.toArray() && rawErr == expectedErr.toArray())
+        let errorText = if (execErrorCase) {
+            let outcome = managedRecoveryReadExecError(directory, parent, nonce, ownerKey).getOrThrow()
+            ownedLateWaitStrictCheck(outcome.phase == "exec" && outcome.error == 2)
+            outcome.originalText
+        } else { "" }
+        if (execErrorCase) { File.writeTo(home.join("original-exec-error"), errorText.toArray()) }
+        ownedLateWaitStrictCheck(!managedRecoveryReadRootCheckpoint(directory, parent).getOrThrow().covers(key))
+        if (hasB) {
+            step = "allocate-b-side-compaction"
+            launchPending = true
+            let b = managedRecoveryLaunchInContext(context, "/bin/sh", ["-c", "exit 0"], None,
+                Some<Map<String, String>>(environment), ProcessRedirect.Discard, ProcessRedirect.Pipe, ProcessRedirect.Pipe)
+            handles.add(b)
+            launchPending = false
+            ownedLateWaitStrictCheck(managedRecoveryReadIssued(directory, parent) == 2)
+            let checkpoint = managedRecoveryReadRootCheckpoint(directory, parent).getOrThrow()
+            if (execErrorCase) {
+                ownedLateWaitStrictCheck(!checkpoint.covers(key) &&
+                    ownedLateWaitReadText(directory.join("${ownerKey}.exec_error")) == errorText)
+                for (suffix in ["intent", "spawned", "birth", "terminal"]) {
+                    ownedLateWaitStrictCheck(exists(directory.join("${key}.${suffix}")))
+                }
+            } else {
+                ownedLateWaitStrictCheck(checkpoint.covers(key))
+                for (suffix in ["intent", "spawned", "birth", "terminal"]) {
+                    ownedLateWaitStrictCheck(!exists(directory.join("${key}.${suffix}")))
+                }
+                compactedBeforeWait = true
+                File.writeTo(home.join("compacted-before-wait.closed"),
+                    File.readFrom(directory.join("roots.closed")))
+            }
+            step = "wait-b"
+            let bDeadline = MonoTime.now() + Duration.second * 5
+            try {
+                let remaining = bDeadline - MonoTime.now()
+                if (remaining <= Duration.Zero) { throw Exception("owned_late_wait_deadline") }
+                ownedLateWaitStrictCheck(b.wait(timeout: Some(remaining)) == 0)
+                let cachedRemaining = bDeadline - MonoTime.now()
+                if (cachedRemaining <= Duration.Zero) { throw Exception("owned_late_wait_deadline") }
+                ownedLateWaitStrictCheck(b.wait(timeout: Some(cachedRemaining)) == 0)
+                bWaited = true
+                ownedLateWaitStrictCheck(ownedTestReadAll(b.stdOutPipe).isEmpty() && ownedTestReadAll(b.stdErrPipe).isEmpty())
+            } finally { b.closeStreams() }
+            ownedLateWaitStrictCheck(b.streamsAreClosed())
+            if (execErrorCase) {
+                ownedLateWaitStrictCheck(ownedLateWaitReadText(directory.join("${ownerKey}.exec_error")) == errorText)
+            }
+        }
+        if (mode != "positive" && !execErrorCase) {
+            step = "negative-source-guard"
+            let target = if (mode == "binding") { directory.join("inventory") }
+                else if (mode == "checkpoint") { directory.join("roots.closed") }
+                else if (mode == "source-spawned") { directory.join("${key}.spawned") }
+                else { directory.join("${key}.terminal") }
+            let original = File.readFrom(target)
+            let text = ownedLateWaitReadText(target)
+            let variant = if (mode == "binding") { text.replace("binding:${nonce}\n", "binding:wrong-binding\n") }
+                else if (mode == "checkpoint") { text.replace("issued:2\n", "issued:3\n") }
+                else { text.replace("pid:${a.pid}\n", "pid:${a.pid + 1}\n") }
+            ownedLateWaitStrictCheck(variant.toArray() != original)
+            File.writeTo(home.join("negative-original.bin"), original)
+            File.writeTo(home.join("negative-variant.bin"), variant.toArray())
+            restoreMutation = Some((target, original))
+            File.writeTo(target, variant.toArray())
+            let unchanged = HashMap<String, Array<Byte>>()
+            for (entry in Directory.readFrom(directory)) { unchanged[entry.name] = File.readFrom(entry.path) }
+            let rejectDeadline = MonoTime.now() + Duration.second * 5
+            try {
+                let remaining = rejectDeadline - MonoTime.now()
+                if (remaining <= Duration.Zero) { throw Exception("owned_late_wait_deadline") }
+                let _ = a.wait(timeout: Some(remaining))
+            } catch (error: TimeoutException) { throw error }
+            catch (_: Exception) { negativeRejected = true }
+            finally { a.closeStreams() }
+            ownedLateWaitStrictCheck(negativeRejected && MonoTime.now() <= rejectDeadline &&
+                Directory.readFrom(directory).size == unchanged.size)
+            for ((name, bytes) in unchanged) { ownedLateWaitStrictCheck(File.readFrom(directory.join(name)) == bytes) }
+            File.writeTo(home.join("negative-before-restore.proof"),
+                "metis-owned-late-wait-negative-v1\nmode:${mode}\nrejected:true\ninputUnchanged:true\n".toArray())
+            File.writeTo(target, original)
+            restoreMutation = None<(Path, Array<Byte>)>
+        }
+        step = "late-wrapper-wait"
+        let aDeadline = MonoTime.now() + Duration.second * 5
+        try {
+            let remaining = aDeadline - MonoTime.now()
+            if (remaining <= Duration.Zero) { throw Exception("owned_late_wait_deadline") }
+            cachedCode = a.wait(timeout: Some(remaining))
+            ownedLateWaitStrictCheck(cachedCode == if (execErrorCase) { 125 } else { expectedCode })
+            let cachedRemaining = aDeadline - MonoTime.now()
+            if (cachedRemaining <= Duration.Zero) { throw Exception("owned_late_wait_deadline") }
+            ownedLateWaitStrictCheck(a.wait(timeout: Some(cachedRemaining)) == cachedCode)
+            wrapperWaited = true
+        } finally { a.closeStreams() }
+        ownedLateWaitStrictCheck(a.streamsAreClosed())
+        step = "formal-generation-drain"
+        let drainDeadline = MonoTime.now() + Duration.second * 5
+        ownedLateWaitStrictCheck(managedRecoveryStopOwnedChildren(context, drainDeadline) && MonoTime.now() <= drainDeadline)
+        let resourceDeadline = MonoTime.now() + Duration.second * 2
+        let source = managedRecoveryProbeRecords(directory, parent, nonce, resourceDeadline)
+        finalSource = source.ok && source.terminal
+        ownedLateWaitStrictCheck(finalSource)
+        while (MonoTime.now() < resourceDeadline) {
+            finalFd = ownedTestFdCount()
+            finalTasks = getThreadCount()
+            finalBlocking = getBlockingThreadCount()
+            finalResources = finalFd == baselineFd && finalTasks <= baselineTasks && finalBlocking <= baselineBlocking
+            if (finalResources) { break }
+            sleep(Duration.millisecond * 5)
+        }
+        ownedLateWaitStrictCheck(finalResources && MonoTime.now() <= resourceDeadline)
+        let finalCheckpoint = managedRecoveryReadRootCheckpoint(directory, parent).getOrThrow()
+        ownedLateWaitStrictCheck(finalCheckpoint.covers(key) && (!hasB || finalCheckpoint.covers("r-2")) &&
+            managedRecoveryReadIssued(directory, parent) == if (hasB) { 2 } else { 1 })
+        formal = true
+        step = "formal-complete"
+    } catch (error: Exception) { failure = Some(error) }
+    finally {
+        try {
+            File.writeTo(home.join("formal-before-fallback.proof"),
+                ("metis-owned-late-wait-formal-v1\nnonce:${nonce}\nmode:${mode}\nstep:${step}\n" +
+                "formal:${formal}\nnativeReaped:${nativeReaped}\ncompactedBeforeWait:${compactedBeforeWait}\n" +
+                "negativeRejected:${negativeRejected}\nwrapperWaited:${wrapperWaited}\ncachedCode:${cachedCode}\n" +
+                "bWaited:${bWaited}\nlaunchPending:${launchPending}\nreturnedHandles:${handles.size}\n" +
+                "sourceTerminal:${finalSource}\nresourcesReturned:${finalResources}\n" +
+                "warmFd:${baselineFd}\nfinalFd:${finalFd}\nwarmCjTasks:${baselineTasks}\nfinalCjTasks:${finalTasks}\n" +
+                "warmCjBlocking:${baselineBlocking}\nfinalCjBlocking:${finalBlocking}\nbodyFailed:${failure.isSome()}\n").toArray())
+            proofSaved = true
+        } catch (error: Exception) { if (failure.isNone()) { failure = Some(error) } }
+        finally {
+            let cleanupDeadline = MonoTime.now() + Duration.second * 5
+            try {
+                if (let Some(original) <- restoreMutation) {
+                    try { File.writeTo(original[0], original[1]) }
+                    catch (error: Exception) { if (failure.isNone()) { failure = Some(error) } }
+                }
+                for (child in handles) {
+                    try {
+                        try { if (child.isAlive()) { child.terminate() } }
+                        catch (error: Exception) { if (failure.isNone()) { failure = Some(error) } }
+                        let remaining = cleanupDeadline - MonoTime.now()
+                        if (remaining <= Duration.Zero) { throw Exception("owned_late_wait_cleanup_pending") }
+                        let _ = child.wait(timeout: Some(remaining))
+                    } catch (error: Exception) { if (failure.isNone()) { failure = Some(error) } }
+                    finally {
+                        try { child.closeStreams() }
+                        catch (error: Exception) { if (failure.isNone()) { failure = Some(error) } }
+                    }
+                }
+                var stopped = !initialized
+                try {
+                    if (initialized && MonoTime.now() < cleanupDeadline) {
+                        stopped = managedRecoveryStopOwnedChildren(context, cleanupDeadline)
+                    }
+                } catch (error: Exception) { if (failure.isNone()) { failure = Some(error) } }
+                var streamsClosed = true
+                for (child in handles) {
+                    try { if (!child.streamsAreClosed()) { streamsClosed = false } }
+                    catch (error: Exception) {
+                        streamsClosed = false
+                        if (failure.isNone()) { failure = Some(error) }
+                    }
+                }
+                cleanupTerminal = stopped && streamsClosed && !launchPending && MonoTime.now() <= cleanupDeadline
+                if (!cleanupTerminal && failure.isNone()) { failure = Some(Exception("owned_late_wait_cleanup_pending")) }
+                try {
+                    File.writeTo(home.join("cleanup-receipt.proof"),
+                        "metis-owned-late-wait-cleanup-v1\nnonce:${nonce}\nterminal:${cleanupTerminal}\nproofSaved:${proofSaved}\n".toArray())
+                } catch (error: Exception) { if (failure.isNone()) { failure = Some(error) } }
+            } finally {
+                try {
+                    match (previousDirectory) {
+                        case Some(value) => setVariable("METIS_PROCESS_RECOVERY_DIRECTORY", value)
+                        case None => removeVariable("METIS_PROCESS_RECOVERY_DIRECTORY")
+                    }
+                } catch (error: Exception) { if (failure.isNone()) { failure = Some(error) } }
+                finally {
+                    try {
+                        match (previousParent) {
+                            case Some(value) => setVariable("METIS_PROCESS_RECOVERY_PARENT", value)
+                            case None => removeVariable("METIS_PROCESS_RECOVERY_PARENT")
+                        }
+                    } catch (error: Exception) { if (failure.isNone()) { failure = Some(error) } }
+                }
+            }
+        }
+    }
+    try {
+        ownedLateWaitStrictCheck(getVariable("METIS_PROCESS_RECOVERY_DIRECTORY") == previousDirectory &&
+            getVariable("METIS_PROCESS_RECOVERY_PARENT") == previousParent)
+        File.writeTo(home.join("environment-restore.proof"),
+            "metis-owned-late-wait-environment-v1\nnonce:${nonce}\ndirectoryOptionRestored:true\nparentOptionRestored:true\n".toArray())
+    } catch (error: Exception) { if (failure.isNone()) { failure = Some(error) } }
+    // Always retain this finite owned fixture, including successful negative
+    // inputs. No fallback operation can promote formal or erase first failure.
+    if (let Some(error) <- failure) { throw error }
+    ownedLateWaitStrictCheck(formal && proofSaved && cleanupTerminal)
 }

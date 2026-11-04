@@ -694,7 +694,7 @@ private class ManagedRecoveryChild <: ManagedOwnedChild {
             if (this.completed.isNone()) {
                 let outcome = managedRecoveryReadExecError(Path(this.context[0]), this.context[1], this.binding, "${this.key}-o-1")
                 let original = outcome.map({ value => value.originalText }).getOrDefault({ => "" })
-                if (!managedRecoveryRetireObservedHelper(this.key, this.context,
+                if (!managedRecoveryRetireRoot(this.context, this.key, this.child.pid,
                     expectedBinding: Some(this.binding), expectedExecText: Some(original))) {
                     throw Exception("owned_process_terminal_evidence_pending")
                 }
