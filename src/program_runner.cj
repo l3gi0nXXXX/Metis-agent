@@ -43,10 +43,12 @@ private func cliRunInteractiveApp(mode: String): Int64 {
         }
     }
     let app = CliApp()
-    if (mode == "setup" || mode == "onboard") {
-        initSettingGuideline()
-    }
-    app.startInteractive(mode: mode)
+    try {
+        if (mode == "setup" || mode == "onboard") {
+            initSettingGuideline()
+        }
+        app.startInteractive(mode: mode)
+    } finally { let _ = app.close() }
     CLI_EXIT_OK
 }
 

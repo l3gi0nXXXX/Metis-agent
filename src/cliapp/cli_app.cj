@@ -5,6 +5,8 @@ import magic.core.agent.Agent
 import magic.core.model.ChatModel
 
 import metis.core.mcp.MCPConfigManager
+import metis.process.managedRecoveryInstallMagicProcessProvider
+import std.time.MonoTime
 import metis.core.conversation.ConversationManager
 import metis.core.commands.CustomCommandManager
 import metis.core.model.TokenStatusManager
@@ -44,44 +46,88 @@ protected class CliApp {
     protected let customAgentManager: CustomAgentManager
     protected let mcpManager: MCPConfigManager
     protected let tokenStatusManager: TokenStatusManager
+    private let recoveryProcesses = managedRecoveryInstallMagicProcessProvider()
+    private var pendingSubagentNoticeWatcher: Option<CliSubagentNoticeWatcher> = None
+    private var noticeClosing = false
 
     protected init() {
-        this.agent = if (let Some(internalSubagent) <- resolveInternalBuiltinSubagent()) {
-            if (!CliConfig.internalSubagentSystemPrompt.trimAscii().isEmpty()) {
-                internalSubagent.systemPrompt =
-                    CliConfig.internalSubagentSystemPrompt.trimAscii() + "\n\n" + internalSubagent.systemPrompt
-            }
-            internalSubagent
-        } else {
-            let lang = CliConfig.language.toAsciiLower()
-            if (lang == 'cangjie') {
-                CangjieCodeAgent()
-            } else if (lang.startsWith("agent:")) {
-                // Currently, this is an internal experimental feature
-                // Customized agent: --language agent:<agent_dir>
-                let agentDir = lang["agent:".size..]
-                CustomAgent(canonicalize(agentDir))
-            } else {
-                GeneralCodeAgent()
-            }
-        }
-        // Load MCP servers and add their tools to the agent
-        this.mcpManager = MCPConfigManager()
+        var initialized = false
+        var clients = None<MCPConfigManager>
         try {
-            agent.toolManager.addTools(mcpManager.loadMCPServers())
-        } catch (ex: Exception) {
-            LogUtils.error("Failed to load MCP servers: ${ex.message}")
-            PrintUtils.printProcedureFailure("MCP Loading", failure: "Failed to load MCP servers, continuing without MCP tools")
+            this.agent = if (let Some(internalSubagent) <- resolveInternalBuiltinSubagent()) {
+                if (!CliConfig.internalSubagentSystemPrompt.trimAscii().isEmpty()) {
+                    internalSubagent.systemPrompt =
+                        CliConfig.internalSubagentSystemPrompt.trimAscii() + "\n\n" + internalSubagent.systemPrompt
+                }
+                internalSubagent
+            } else {
+                let lang = CliConfig.language.toAsciiLower()
+                if (lang == 'cangjie') {
+                    CangjieCodeAgent()
+                } else if (lang.startsWith("agent:")) {
+                    // Currently, this is an internal experimental feature
+                    // Customized agent: --language agent:<agent_dir>
+                    let agentDir = lang["agent:".size..]
+                    CustomAgent(canonicalize(agentDir))
+                } else {
+                    GeneralCodeAgent()
+                }
+            }
+            // Load MCP servers and add their tools to the agent
+            this.mcpManager = MCPConfigManager()
+            clients = Some(this.mcpManager)
+            try {
+                agent.toolManager.addTools(mcpManager.loadMCPServers())
+            } catch (ex: Exception) {
+                LogUtils.error("Failed to load MCP servers: ${ex.message}")
+                PrintUtils.printProcedureFailure("MCP Loading", failure: "Failed to load MCP servers, continuing without MCP tools")
+            }
+
+            this.conversationManager = ConversationManager(FileContextCompactor())
+            this.customCommandManager = CustomCommandManager()
+            this.customAgentManager = CustomAgentManager()
+            this.tokenStatusManager = TokenStatusManager()
+
+            // Initialize event handlers and callbacks
+            registerHooks(this)
+            initialized = true
+        } finally {
+            if (!initialized) {
+                if (let Some(scope) <- this.recoveryProcesses) { scope.fence() }
+                let consumers = match (clients) { case Some(manager) => manager.close() case None => true }
+                if (let Some(scope) <- this.recoveryProcesses) {
+                    let deadline = MonoTime.now() + Duration.second * 5
+                    if (consumers) { let _ = scope.restoreAfterTerminal(deadline) } else { let _ = scope.stop(deadline) }
+                }
+            }
         }
-
-        this.conversationManager = ConversationManager(FileContextCompactor())
-        this.customCommandManager = CustomCommandManager()
-        this.customAgentManager = CustomAgentManager()
-        this.tokenStatusManager = TokenStatusManager()
-
-        // Initialize event handlers and callbacks
-        registerHooks(this)
     }
+
+    public func close(): Bool {
+        synchronized(this.mutex) { this.noticeClosing = true }
+        if (let Some(scope) <- this.recoveryProcesses) { scope.fence() }
+        let deadline = MonoTime.now() + Duration.second * 5
+        let remaining = deadline - MonoTime.now()
+        let watchers = this.stopPendingSubagentNoticeWatcher(
+            if (remaining < Duration.second * 2) { remaining } else { Duration.second * 2 })
+        let consumers = this.mcpManager.close()
+        if (let Some(scope) <- this.recoveryProcesses) {
+            if (!consumers || !watchers) { let _ = scope.stop(deadline); return false }
+            return scope.restoreAfterTerminal(deadline)
+        }
+        consumers && watchers
+    }
+
+    private func stopPendingSubagentNoticeWatcher(timeout: Duration): Bool {
+        synchronized(this.mutex) {
+            if (let Some(watcher) <- this.pendingSubagentNoticeWatcher) {
+                if (!watcher.stop(timeout: timeout)) { return false }
+                this.pendingSubagentNoticeWatcher = None
+            }
+            true
+        }
+    }
+
 
     func startThinkIndicator(message: String) {
         this.thinkIndicator.store(PrintUtils.printStatusIndicator(message: message))
@@ -143,7 +189,15 @@ protected class CliApp {
                 let _ = gatewayLaunchDedicatedConsole()
             }
         }
-        let subagentNoticeWatcher = startCliSubagentNoticeWatcher()
+        synchronized(this.mutex) {
+            if (this.noticeClosing) { throw Exception("cli_notice_watcher_closing") }
+            if (this.pendingSubagentNoticeWatcher.isSome()) {
+                throw Exception("cli_notice_watcher_cleanup_pending")
+            }
+            let watcher = CliSubagentNoticeWatcher("main")
+            this.pendingSubagentNoticeWatcher = Some(watcher)
+            watcher.start()
+        }
         try {
             // Simplified event loop
             while (true) {
@@ -160,7 +214,8 @@ protected class CliApp {
                 }
             }
         } finally {
-            subagentNoticeWatcher.stop()
+            // Failed joins retain the same object for close() and its retry.
+            let _ = this.stopPendingSubagentNoticeWatcher(Duration.second * 2)
         }
     }
 
