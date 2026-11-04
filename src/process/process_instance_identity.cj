@@ -82,6 +82,75 @@ public class ProcessInstanceSignalResult {
     }
 }
 
+/** Read-only birth observation; deliberately cannot be used by signalProcessInstance. */
+public class ProcessBirthIdentity {
+    public let pid: Int64
+    public let seconds: UInt64
+    public let microseconds: UInt64
+    public init(pid: Int64, seconds: UInt64, microseconds: UInt64) {
+        this.pid = pid; this.seconds = seconds; this.microseconds = microseconds
+    }
+    public func serialize(): String { "${this.pid}:${this.seconds}:${this.microseconds}" }
+}
+
+public func parseProcessBirthIdentity(text: String): ?ProcessBirthIdentity {
+    let fields = text.split(":")
+    if (fields.size != 3) { return None }
+    try {
+        let value = ProcessBirthIdentity(Int64.parse(fields[0]), UInt64.parse(fields[1]), UInt64.parse(fields[2]))
+        if (value.pid <= 1 || value.pid > 2147483647 || value.seconds == 0 || value.microseconds >= 1000000) { return None }
+        Some(value)
+    } catch (_: Exception) { None }
+}
+
+@When[os == "macOS"]
+public func observeProcessBirthIdentity(pid: Int64): ?ProcessBirthIdentity {
+    match (processInstanceMacStart(pid)) {
+        case Some(value) => Some(ProcessBirthIdentity(pid, value[0], value[1]))
+        case None => None
+    }
+}
+
+@When[os != "macOS"]
+public func observeProcessBirthIdentity(_pid: Int64): ?ProcessBirthIdentity { None }
+
+@When[os == "macOS"]
+public func probeProcessBirthIdentity(identity: ProcessBirthIdentity, deadline: MonoTime): ProcessInstanceProbeResult {
+    if (MonoTime.now() >= deadline) { return ProcessInstanceProbeResult(false, false, "deadline_exceeded") }
+    match (processInstanceMacStart(identity.pid)) {
+        case Some(value) => ProcessInstanceProbeResult(true,
+            value[0] == identity.seconds && value[1] == identity.microseconds,
+            if (value[0] == identity.seconds && value[1] == identity.microseconds) { "alive" } else { "stale_identity" })
+        case None =>
+            let error = processInstanceMacErrno()
+            if (error == 3) { ProcessInstanceProbeResult(true, false, "gone") }
+            else { ProcessInstanceProbeResult(false, false, if (error == 1) { "permission_denied" } else { "probe_failed" }) }
+    }
+}
+
+@When[os != "macOS"]
+public func probeProcessBirthIdentity(_identity: ProcessBirthIdentity, _deadline: MonoTime): ProcessInstanceProbeResult {
+    ProcessInstanceProbeResult(false, false, "identity_unsupported")
+}
+
+/** Presence only. Never supplies an identity for signaling or ownership attribution. */
+@When[os == "macOS"]
+public func probeProcessPidPresence(pid: Int64, deadline: MonoTime): ProcessInstanceProbeResult {
+    if (pid <= 1 || pid > 2147483647) { return ProcessInstanceProbeResult(false, false, "identity_unsupported") }
+    if (MonoTime.now() >= deadline) { return ProcessInstanceProbeResult(false, false, "deadline_exceeded") }
+    match (processInstanceMacStart(pid)) {
+        case Some(_) => ProcessInstanceProbeResult(true, true, "pid_present_identity_unknown")
+        case None =>
+            if (processInstanceMacErrno() == 3) { ProcessInstanceProbeResult(true, false, "gone") }
+            else { ProcessInstanceProbeResult(false, false, "probe_failed") }
+    }
+}
+
+@When[os != "macOS"]
+public func probeProcessPidPresence(_pid: Int64, _deadline: MonoTime): ProcessInstanceProbeResult {
+    ProcessInstanceProbeResult(false, false, "identity_unsupported")
+}
+
 private let PROCESS_INSTANCE_MACOS: Int64 = 1
 private let PROCESS_INSTANCE_WINDOWS: Int64 = 2
 private let PROCESS_INSTANCE_SIGNAL_TERM: Int64 = 15

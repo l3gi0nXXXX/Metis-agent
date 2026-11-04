@@ -1,10 +1,10 @@
 package metis.process
 
 import std.collection.{ArrayList, HashMap}
-import std.env.{getVariable, getVariables}
-import std.fs.{Path, canonicalize, exists}
+import std.env.{getCommand, getVariable, getVariables}
+import std.fs.{File, FileInfo, OpenMode, Path, canonicalize, exists}
 import std.io.{InputStream, OutputStream, StringReader, StringWriter}
-import std.process.{ProcessRedirect, SubProcess, launch}
+import std.process.{ProcessRedirect, launch}
 import std.sync.{Condition, Mutex}
 import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
@@ -74,7 +74,7 @@ public func managedStdioResolveBrokerScriptPath(
     match (getVariable("METIS_STDIO_BROKER_SCRIPT")) {
         case Some(value) =>
             let configured = value.trimAscii()
-            if (!configured.isEmpty()) { return configured }
+            if (!configured.isEmpty()) { return managedStdioBindInternalCommand(configured) }
         case None => ()
     }
     match (getVariable("METIS_CJPM_ROOT")) {
@@ -93,18 +93,109 @@ public func managedStdioResolveBrokerScriptPath(
             if (exists(candidate)) { return try { canonicalize(candidate).toString() } catch (_: Exception) { candidate.toString() } }
         case None => ()
     }
+    // Installed bundles keep the broker beside bin/, independent of the user's cwd.
+    try {
+        let executable = canonicalize(Path(getCommand()))
+        let candidate = executable.parent.parent.join("scripts").join("metis-stdio-broker.mjs")
+        if (exists(candidate)) { return canonicalize(candidate).toString() }
+    } catch (_: Exception) { () }
     ""
 }
 
-private func managedStdioResolveNodeCommand(): String {
+public func managedStdioResolveNodeCommand(): String {
     match (getVariable("METIS_STDIO_BROKER_NODE_COMMAND")) {
         case Some(value) =>
             let configured = value.trimAscii()
             if (!configured.isEmpty()) { return configured }
         case None => ()
     }
-    "node"
+    managedStdioBindInternalCommand("node")
 }
+
+@When[os == "macOS"]
+foreign { func access(path: CString, mode: Int32): Int32 }
+
+// Darwin stat64 layout is the public 144-byte Xcode sys/stat.h ABI:
+// mode at byte 4, mtime seconds/nanoseconds at bytes 48/56.
+@When[os == "macOS" && arch == "aarch64"]
+foreign { func lstat(path: CString, buffer: CPointer<UInt64>): Int32 }
+
+@When[os == "macOS" && arch == "x86_64"]
+foreign { func lstat64(path: CString, buffer: CPointer<UInt64>): Int32 }
+
+@When[os == "macOS"]
+private func managedStdioArtifactMetadata(path: Path): Option<(Int64, Float64)> {
+    let buffer = unsafe { LibC.malloc<UInt64>(count: 18) }
+    if (buffer.isNull()) { return None<(Int64, Float64)> }
+    try {
+        let name = unsafe { LibC.mallocCString(path.toString()) }
+        try {
+            @When[arch == "aarch64"]
+            let result = unsafe { lstat(name, buffer) }
+            @When[arch == "x86_64"]
+            let result = unsafe { lstat64(name, buffer) }
+            if (result != 0) { return None<(Int64, Float64)> }
+            let mode = Int64(unsafe { buffer.read(0) } >> 32 & 0xffff)
+            let seconds = Int64(unsafe { buffer.read(6) })
+            let nanos = Int64(unsafe { buffer.read(7) })
+            if (nanos < 0 || nanos >= 1000000000) { return None<(Int64, Float64)> }
+            Some((mode, Float64(seconds) * 1000.0 + Float64(nanos) / 1000000.0))
+        } finally { unsafe { LibC.free(name) } }
+    } finally { unsafe { LibC.free(buffer) } }
+}
+
+@When[os == "macOS"]
+private func managedStdioNativeGateArtifactsValid(script: Path): Bool {
+    let root = script.parent.parent
+    let development = exists(root.join("src"))
+    let gate = root.join(if (development) { "target/native/metis-exec-gate-v1" } else { "libexec/metis-exec-gate-v1" })
+    var current = gate
+    var built = 0.0
+    while (true) {
+        let metadata = managedStdioArtifactMetadata(current).getOrThrow()
+        let mode = metadata[0]
+        if ((mode & 0xf000) == 0xa000) { return false }
+        if (current == gate) {
+            if ((mode & 0xf000) != 0x8000 || (mode & 0o111) == 0 || (mode & 0o022) != 0) { return false }
+            built = metadata[1]
+        }
+        let parent = current.parent
+        if (parent == current) { break }
+        current = parent
+    }
+    let name = unsafe { LibC.mallocCString(gate.toString()) }
+    let executable = try { unsafe { access(name, 1) } == 0 } finally { unsafe { LibC.free(name) } }
+    if (!executable) { return false }
+    if (development) {
+        for (input in [root.join("src/process/managed_exec_gate.c"), root.join("build.cj")]) {
+            let metadata = managedStdioArtifactMetadata(input).getOrThrow()
+            if ((metadata[0] & 0xf000) != 0x8000 || metadata[1] > built) { return false }
+        }
+    }
+    true
+}
+
+@When[os != "macOS"]
+private func managedStdioNativeGateArtifactsValid(_script: Path): Bool { true }
+
+@When[os == "macOS"]
+private func managedStdioBindInternalCommand(command: String): String {
+    let cwd = canonicalize(Path("."))
+    if (command.contains("/")) {
+        return if (Path(command).isAbsolute()) { command } else { cwd.join(command).toString() }
+    }
+    for (entry in getVariable("PATH").getOrDefault({ => "/usr/bin:/bin" }).split(":")) {
+        let base = if (entry.isEmpty()) { cwd } else if (Path(entry).isAbsolute()) { Path(entry) } else { cwd.join(entry) }
+        let candidate = base.join(command).toString()
+        let path = unsafe { LibC.mallocCString(candidate) }
+        let executable = try { unsafe { access(path, 1) } == 0 } finally { unsafe { LibC.free(path) } }
+        if (executable) { return candidate }
+    }
+    cwd.join(command).toString()
+}
+
+@When[os != "macOS"]
+private func managedStdioBindInternalCommand(command: String): String { command }
 
 public class ManagedStdioOwnerSpec {
     public let ownerId: String
@@ -315,12 +406,27 @@ private func managedStdioWindowsPidAlive(pid: Int64): Bool {
 @When[os != "Windows"]
 private func managedStdioWindowsPidAlive(pid: Int64): Bool { false }
 
+@When[os == "macOS"]
+private func managedStdioNativeTreeOperation(pgid: Int64, signal: Int32): ?Bool {
+    if (pgid > 2147483647) { return Some(signal == 0) }
+    let result = unsafe { kill(-Int32(pgid), signal) }
+    if (result == 0) { return Some(true) }
+    let errorCode = unsafe { __error().read() }
+    Some(if (signal == 0) { errorCode != 3 } else { errorCode == 3 })
+}
+
+@When[os != "macOS"]
+private func managedStdioNativeTreeOperation(_pgid: Int64, _signal: Int32): ?Bool { None }
+
 public class ManagedStdioDefaultPlatformRunner <: ManagedStdioPlatformRunner {
     private let platform: String
     public init(platform!: String = managedStdioPlatformName()) { this.platform = platform }
 
     public func terminateTree(pid: Int64, pgid: Int64, force: Bool): Bool {
         if (pid <= 1 || (this.platform != "windows" && (pgid <= 1 || pgid != pid))) { return false }
+        if (this.platform != "windows") {
+            if (let Some(result) <- managedStdioNativeTreeOperation(pgid, if (force) { Int32(9) } else { Int32(15) })) { return result }
+        }
         let (command, args) = managedStdioTerminationArgv(this.platform, pid, pgid, force)
         try {
             let proc = launch(command, args, stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.Discard, stdErr: ProcessRedirect.Discard)
@@ -334,6 +440,7 @@ public class ManagedStdioDefaultPlatformRunner <: ManagedStdioPlatformRunner {
     public func treeAlive(pid: Int64, pgid: Int64): Bool {
         if (pid <= 1 || (this.platform != "windows" && (pgid <= 1 || pgid != pid))) { return false }
         if (this.platform == "windows") { return managedStdioWindowsPidAlive(pid) }
+        if (let Some(result) <- managedStdioNativeTreeOperation(pgid, Int32(0))) { return result }
         try {
             let proc = launch("/bin/kill", ["-0", "--", "-${pgid}"], stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.Discard, stdErr: ProcessRedirect.Discard)
             proc.wait(timeout: Some(Duration.second)) == 0
@@ -406,7 +513,7 @@ public class ManagedStdioBrokerClient {
     private let platformRunner: ManagedStdioPlatformRunner
     private let platformName: String
     private let brokerTestMode: Bool
-    private var process: Option<SubProcess> = None<SubProcess>
+    private var process: Option<ManagedOwnedChild> = None<ManagedOwnedChild>
     private var writer: Option<StringWriter<OutputStream>> = None<StringWriter<OutputStream>>
     private var readerFuture: Option<Future<Unit>> = None<Future<Unit>>
     private var dispatchFuture: Option<Future<Unit>> = None<Future<Unit>>
@@ -436,6 +543,9 @@ public class ManagedStdioBrokerClient {
     private var closeTerminalBasis: String = "unknown"
     private var holdCloseReaderSettleForTest: Bool = false
     private var closeReaderSettleIsHeldForTest: Bool = false
+    private var recoveryBrokerKey: String = ""
+    private var recoveryDirectory: String = ""
+    private var recoveryParent: String = ""
 
     public init(
         nodeCommand!: String = "node",
@@ -462,6 +572,17 @@ public class ManagedStdioBrokerClient {
         }
     }
 
+    /** Checks only this client's selected internal files; never starts a process. */
+    public func validateInternalArtifacts(requireNativeGate!: Bool = false): Bool {
+        try {
+            if (this.brokerScriptPath.isEmpty()) { return false }
+            let script = canonicalize(Path(this.brokerScriptPath))
+            if (!FileInfo(script).isRegular()) { return false }
+            try (input = File(script, OpenMode.Read)) { () }
+            !requireNativeGate || managedStdioNativeGateArtifactsValid(script)
+        } catch (_: Exception) { false }
+    }
+
     private func nowMs(): Int64 { DateTime.now().toUnixTimeStamp().toMilliseconds() }
 
     private func activeOwnerCountLocked(): Int64 {
@@ -476,8 +597,15 @@ public class ManagedStdioBrokerClient {
     // generation's process and both client workers have reached terminal state.
     private func tryFinalizeFailedCloseLocked(closeGeneration: Int64, closeStatus: String): Unit {
         if (this.generation != closeGeneration || !this.closing || closeStatus.isEmpty() ||
-            this.closeFailureStatus != closeStatus || this.process.isSome() ||
-            this.readerCount != 0 || this.dispatcherCount != 0) { return }
+            this.closeFailureStatus != closeStatus || this.readerCount != 0 || this.dispatcherCount != 0) { return }
+        if (let Some(process) <- this.process) {
+            try {
+                let _ = process.wait(timeout: Some(Duration.millisecond))
+                process.closeStreams()
+                if (!process.streamsAreClosed()) { return }
+            } catch (_: Exception) { return }
+            this.process = None<ManagedOwnedChild>
+        }
         this.writer = None<StringWriter<OutputStream>>
         this.readerFuture = None<Future<Unit>>
         this.dispatchFuture = None<Future<Unit>>
@@ -495,6 +623,15 @@ public class ManagedStdioBrokerClient {
     }
 
     public func ensureBrokerRunning(timeoutMs!: Int64 = MANAGED_STDIO_BROKER_START_TIMEOUT_MS): ManagedStdioOperationResult {
+        let result = this.ensureBrokerStarted(timeoutMs)
+        if (!result.ok) {
+            // Outside writerLock/state lock: close joins the actual reader before clearing ownership.
+            let _ = this.close()
+        }
+        result
+    }
+
+    private func ensureBrokerStarted(timeoutMs: Int64): ManagedStdioOperationResult {
         let existing = synchronized(this.lock) {
             match (this.process) {
                 case Some(proc) => proc.isAlive() && this.helloReceived && !this.closing
@@ -506,7 +643,7 @@ public class ManagedStdioBrokerClient {
             return ManagedStdioOperationResult(true, "ready", generation: snapshot.generation, pid: snapshot.brokerPid)
         }
         synchronized(this.writerLock) {
-            var staleProcess = None<SubProcess>
+            var staleProcess = None<ManagedOwnedChild>
             var staleReader = None<Future<Unit>>
             var staleGeneration: Int64 = 0
             var needsStaleJoin = false
@@ -538,9 +675,10 @@ public class ManagedStdioBrokerClient {
                 if (!readerJoined) {
                     return ManagedStdioOperationResult(false, "broker_unavailable", generation: staleGeneration)
                 }
+                match (staleProcess) { case Some(proc) => proc.closeStreams() case None => () }
                 synchronized(this.lock) {
                     if (this.generation == staleGeneration) {
-                        this.process = None<SubProcess>
+                        this.process = None<ManagedOwnedChild>
                         this.writer = None<StringWriter<OutputStream>>
                         this.readerFuture = None<Future<Unit>>
                         this.readerCount = 0
@@ -573,9 +711,21 @@ public class ManagedStdioBrokerClient {
                 let env = HashMap<String, String>()
                 for ((key, value) in getVariables()) { env[key] = value }
                 env["METIS_STDIO_BROKER_GENERATION"] = "${this.generation}"
+                let recovery = managedRecoveryContext()
+                this.recoveryDirectory = recovery[0]
+                this.recoveryParent = recovery[1]
+                if (!recovery[0].isEmpty()) {
+                    this.recoveryBrokerKey = managedRecoveryNextBrokerKey(this.generation)
+                    if (!managedRecoveryPublishFact(Path(recovery[0]), this.recoveryBrokerKey, "intent", recovery[1])) {
+                        this.status = "recovery_write_failed"
+                        return ManagedStdioOperationResult(false, this.status, generation: this.generation)
+                    }
+                    env["METIS_PROCESS_RECOVERY_BROKER_KEY"] = this.recoveryBrokerKey
+                    managedRecoveryBindHelperParent(env)
+                }
                 if (this.brokerTestMode) { env["METIS_STDIO_BROKER_TEST_MODE"] = "1" }
                 try {
-                    let proc = launch(
+                    let proc = launchManagedRawChild(
                         this.nodeCommand,
                         [this.brokerScriptPath],
                         environment: env,
@@ -589,11 +739,9 @@ public class ManagedStdioBrokerClient {
                     let readerGeneration = this.generation
                     this.readerFuture = Some(spawn { this.readBrokerOutput(proc, readerGeneration) })
                 } catch (_: Exception) {
-                    this.process = None<SubProcess>
-                    this.writer = None<StringWriter<OutputStream>>
-                    this.readerFuture = None<Future<Unit>>
+                    // Keep the returned handle and any started reader for the common close path.
                     this.status = "broker_unavailable"
-                    this.readerCount = 0
+                    if (this.readerFuture.isNone()) { this.readerCount = 0 }
                     return ManagedStdioOperationResult(false, "broker_unavailable", generation: this.generation)
                 }
                 this.waitForHelloLocked(timeoutMs)
@@ -701,7 +849,7 @@ public class ManagedStdioBrokerClient {
                     }
                     if (!settled) {
                         let proc = synchronized(this.lock) {
-                            if (this.generation == state.generation) { this.process } else { None<SubProcess> }
+                            if (this.generation == state.generation) { this.process } else { None<ManagedOwnedChild> }
                         }
                         match (proc) {
                             case Some(value) => try { value.terminate(force: true) } catch (_: Exception) { () }
@@ -1293,7 +1441,7 @@ public class ManagedStdioBrokerClient {
                 if (this.generation == expectedGeneration) {
                     (true, this.process)
                 } else {
-                    (false, None<SubProcess>)
+                    (false, None<ManagedOwnedChild>)
                 }
             }
             if (!selectedProcess[0]) {
@@ -1333,7 +1481,7 @@ public class ManagedStdioBrokerClient {
         }
     }
 
-    private func readBrokerOutput(proc: SubProcess, readerGeneration: Int64): Unit {
+    private func readBrokerOutput(proc: ManagedOwnedChild, readerGeneration: Int64): Unit {
         let reader = StringReader<InputStream>(proc.stdOutPipe)
         var exitReason = "broker_exited"
         try {
@@ -1394,6 +1542,16 @@ public class ManagedStdioBrokerClient {
             synchronized(this.lock) {
                 if (this.generation != readerGeneration) { return }
                 this.brokerPid = managedStdioJsonInt(obj, "pid", 0)
+                let recovery = (this.recoveryDirectory, this.recoveryParent)
+                if (!recovery[0].isEmpty()) {
+                    let birth = observeProcessBirthIdentity(this.brokerPid)
+                    if (birth.isNone() || !managedRecoveryPublishFact(Path(recovery[0]), this.recoveryBrokerKey, "birth", recovery[1],
+                        pid: this.brokerPid, birth: birth.getOrThrow().serialize())) {
+                        this.status = "recovery_identity_unknown"
+                        this.condition.notifyAll()
+                        return
+                    }
+                }
                 this.helloReceived = true
                 this.status = "ready"
                 this.condition.notifyAll()
@@ -1431,6 +1589,7 @@ public class ManagedStdioBrokerClient {
         }
         let ownerId = managedStdioJsonString(obj, "ownerId")
         var stopForCapacity = false
+        var recoveryCommit = None<JsonObject>
         synchronized(this.lock) {
             match (this.owners.get(ownerId)) {
                 case None => ()
@@ -1440,6 +1599,27 @@ public class ManagedStdioBrokerClient {
                         if (managedStdioJsonString(obj, "requestId") != state.startRequestId) { return }
                         state.pid = managedStdioJsonInt(obj, "pid", 0)
                         state.pgid = managedStdioJsonInt(obj, "pgid", 0)
+                        let recovery = (this.recoveryDirectory, this.recoveryParent)
+                        if (recovery[0].isEmpty()) {
+                            state.status = "running"
+                        } else {
+                            let key = managedStdioJsonString(obj, "recoveryKey")
+                            let birth = observeProcessBirthIdentity(state.pid)
+                            if (birth.isSome() && managedRecoveryPublishFact(Path(recovery[0]), key, "birth", recovery[1],
+                                pid: state.pid, pgid: state.pgid, birth: birth.getOrThrow().serialize())) {
+                                let commit = JsonObject()
+                                commit.put("type", JsonString("owner.recovery-commit"))
+                                commit.put("ownerId", JsonString(ownerId))
+                                commit.put("ownerIncarnation", JsonString(state.startRequestId))
+                                recoveryCommit = Some(commit)
+                            } else {
+                                state.status = "recovery_write_failed"
+                                stopForCapacity = true
+                            }
+                        }
+                        state.condition.notifyAll()
+                    } else if (frameType == "owner.recovery-ready") {
+                        if (managedStdioJsonString(obj, "requestId") != state.startRequestId) { return }
                         state.status = "running"
                         state.condition.notifyAll()
                     } else if (frameType == "owner.stopping") {
@@ -1492,6 +1672,10 @@ public class ManagedStdioBrokerClient {
                     }
             }
         }
+        match (recoveryCommit) {
+            case Some(frame) => let _ = this.writeFrameForGeneration(frame, readerGeneration)
+            case None => ()
+        }
         if (stopForCapacity) {
             let stop = JsonObject()
             stop.put("type", JsonString("owner.stop"))
@@ -1503,7 +1687,8 @@ public class ManagedStdioBrokerClient {
 
     private func handleBrokerExit(readerGeneration: Int64, reason: String): Unit {
         let reap = ArrayList<(Int64, Int64)>()
-        var brokerProcess = None<SubProcess>
+        var brokerProcess = None<ManagedOwnedChild>
+        var reaped = false
         synchronized(this.lock) {
             if (readerGeneration != this.generation) { return }
             if (this.exitHandledGeneration == readerGeneration) { return }
@@ -1511,7 +1696,6 @@ public class ManagedStdioBrokerClient {
             this.brokerExitObservedGeneration = readerGeneration
             this.brokerExitReason = reason
             if (!this.closing) { brokerProcess = this.process }
-            this.process = None<SubProcess>
             this.writer = None<StringWriter<OutputStream>>
             this.helloReceived = false
             this.brokerPid = 0
@@ -1529,11 +1713,20 @@ public class ManagedStdioBrokerClient {
         }
         match (brokerProcess) {
             case Some(value) =>
-                if (value.isAlive()) { try { value.terminate(force: true) } catch (_: Exception) { () } }
-                try { let _ = value.wait(timeout: Some(Duration.second)) } catch (_: Exception) { () }
+                try { if (value.isAlive()) { value.terminate(force: true) } } catch (_: Exception) { () }
+                try { let _ = value.wait(timeout: Some(Duration.second)); reaped = true } catch (_: Exception) { () }
+                value.closeStreams()
+                if (reaped && value.streamsAreClosed()) {
+                    synchronized(this.lock) {
+                        if (readerGeneration == this.generation) { this.process = None<ManagedOwnedChild> }
+                    }
+                }
             case None => ()
         }
         if (!reap.isEmpty()) { this.emergencyReapGeneration(reap.toArray()) }
+        if (reaped && !this.recoveryDirectory.isEmpty()) {
+            let _ = managedRecoveryRetireObservedHelper(this.recoveryBrokerKey, (this.recoveryDirectory, this.recoveryParent))
+        }
         synchronized(this.lock) {
             if (this.brokerTestMode && readerGeneration == this.generation && this.closing &&
                 this.holdCloseReaderSettleForTest) {
@@ -1570,6 +1763,7 @@ public class ManagedStdioBrokerClient {
     public func close(timeoutMs!: Int64 = 2000): ManagedStdioOperationResult {
         let deadline = this.nowMs() + max(1, timeoutMs)
         let claim = synchronized(this.lock) {
+            this.tryFinalizeFailedCloseLocked(this.generation, this.closeFailureStatus)
             if (!this.closeFailureStatus.isEmpty()) {
                 (this.closeFailureStatus, this.generation, this.process)
             } else if (this.closing) {
@@ -1645,6 +1839,9 @@ public class ManagedStdioBrokerClient {
         if (closeStatus == "stopped" && (!exitObserved || exitCode != 0)) {
             closeStatus = "broker_close_exit_nonzero"
         }
+        if (exitObserved && !this.recoveryDirectory.isEmpty()) {
+            let _ = managedRecoveryRetireObservedHelper(this.recoveryBrokerKey, (this.recoveryDirectory, this.recoveryParent))
+        }
         let reader = synchronized(this.lock) { this.readerFuture }
         let readerJoined = match (reader) {
             case Some(future) =>
@@ -1661,6 +1858,7 @@ public class ManagedStdioBrokerClient {
             this.condition.notifyAll()
             this.dispatchFuture
         }
+        if (readerJoined) { match (proc) { case Some(value) => value.closeStreams() case None => () } }
         let dispatcherJoined = match (dispatcher) {
             case Some(future) =>
                 let remaining = deadline - this.nowMs()
@@ -1671,7 +1869,8 @@ public class ManagedStdioBrokerClient {
                 }
             case None => true
         }
-        if (closeStatus == "stopped" && (!readerJoined || !dispatcherJoined)) {
+        let streamsClosed = match (proc) { case Some(value) => value.streamsAreClosed() case None => false }
+        if (closeStatus == "stopped" && (!readerJoined || !dispatcherJoined || !exitObserved || !streamsClosed)) {
             closeStatus = "broker_shutdown_timeout"
         }
         let exitReason = synchronized(this.lock) { this.brokerExitReason }
@@ -1682,15 +1881,15 @@ public class ManagedStdioBrokerClient {
                 "broker_close_eof_before_ack"
             }
         }
-        let externalTerminal = closeWritten && closeAcknowledged && exitObserved
+        let externalTerminal = closeWritten && closeAcknowledged && exitObserved && streamsClosed && readerJoined && dispatcherJoined
         let terminalBasis = if (externalTerminal) { "closed_ack_exit_observed" } else { "unknown" }
         synchronized(this.lock) {
             this.closeExternalTerminal = externalTerminal
             this.closeTerminalBasis = terminalBasis
         }
-        if (readerJoined && dispatcherJoined) {
+        if (readerJoined && dispatcherJoined && exitObserved && streamsClosed) {
             synchronized(this.lock) {
-                this.process = None<SubProcess>
+                this.process = None<ManagedOwnedChild>
                 this.writer = None<StringWriter<OutputStream>>
                 this.readerFuture = None<Future<Unit>>
                 this.helloReceived = false
@@ -1796,6 +1995,7 @@ public class ManagedStdioBrokerClient {
 
     public func snapshot(): ManagedStdioBrokerSnapshot {
         synchronized(this.lock) {
+            this.tryFinalizeFailedCloseLocked(this.generation, this.closeFailureStatus)
             ManagedStdioBrokerSnapshot(
                 this.process.map({ value => value.isAlive() }).getOrDefault({ => false }),
                 this.status == "ready",

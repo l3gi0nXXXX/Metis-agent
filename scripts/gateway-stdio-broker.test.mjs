@@ -683,8 +683,13 @@ test('HB-BR-P2 terminal owner is removed before acknowledged two-second broker c
 
 test('P1-B1 validates owner specs, hard limit 255/256/257, and writer drain backpressure', () => {
   assert.equal(validateStartFrame(validStart()), true);
+  assert.equal(validateStartFrame(validStart('env-values', {
+    env: { ['k'.repeat(256)]: '', '中文😀': '合成值\nquoted' },
+  })), true);
   for (const patch of [{ command: '' }, { command: 'x\0y' }, { args: ['x\0y'] }, { requestId: 'bad\nrequest' },
-    { env: { 'bad\nkey': 'value' } }, { maxLineBytes: -1 }, { stdinMode: 'bad' }]) {
+    { env: { 'bad\nkey': 'value' } }, { env: { '': 'value' } }, { env: { 'bad\0key': 'value' } },
+    { env: { 'bad=key': 'value' } }, { env: { 'bad\u0001key': 'value' } }, { env: { 'bad\u007fkey': 'value' } },
+    { env: { ['k'.repeat(257)]: 'value' } }, { maxLineBytes: -1 }, { stdinMode: 'bad' }]) {
     assert.throws(() => validateStartFrame(validStart('bad', patch)), /invalid_owner_spec/);
   }
   const output = new CollectingWritable();
@@ -922,4 +927,36 @@ test('P1-N3 test hang is gated and broker stdin has an exact raw byte cap', asyn
   assert.equal(privateOutput.frames().at(-1).status, 'spawn_failed');
   assert.equal(privateOutput.text.includes('TEST_SECRET'), false);
   assert.equal(privateOutput.text.includes('/Users/private/work'), false);
+});
+
+
+test('R-S1-N1 unknown tree probes cannot claim terminal and attached diagnostics avoid fd2', () => {
+  for (const code of ['ESRCH', 'EPERM', 'EINVAL', undefined]) {
+    const output = new CollectingWritable();
+    const broker = new StdioBroker({ output, treeRunner: {
+      alive: () => { const error = new Error('fixture'); error.code = code; throw error; }, terminate: () => {},
+    }, exit: () => {} });
+    const owner = { id: 'unknown-probe', child: { pid: 543210 }, spawned: true, closed: true, settled: false };
+    assert.equal(broker.treeAlive(owner), code !== 'ESRCH');
+    if (code !== 'ESRCH') {
+      broker.settleAfterTreeGone(owner, 'owner.exit', { exitCode: 0 });
+      assert.equal(owner.settled, false);
+      assert.equal(output.frames().some(frame => frame.type === 'owner.exit'), false);
+      clearTimeout(owner.reapTimer);
+    }
+    broker.writer.close();
+  }
+  const output = new CollectingWritable();
+  const broker = new StdioBroker({ output, attachedStdio: true, exit: () => {} });
+  const original = process.stderr.write;
+  let writes = 0;
+  process.stderr.write = () => { writes += 1; return true; };
+  try {
+    broker.stderrDiagnostic('fixed diagnostic\n', 'recovery_persistence_failed');
+    assert.equal(writes, 0);
+    assert.equal(output.frames().at(-1).status, 'recovery_persistence_failed');
+    broker.attachedStdio = false;
+    broker.stderrDiagnostic('fixed diagnostic\n', 'recovery_persistence_failed');
+    assert.equal(writes, 1);
+  } finally { process.stderr.write = original; broker.writer.close(); }
 });
