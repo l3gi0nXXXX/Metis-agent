@@ -1,5 +1,7 @@
 package metis.lsp
 
+import metis.process.{ManagedOwnedChild, managedRecoveryLaunchOwned}
+
 import magic.dsl.jsonable
 import magic.log.LogUtils
 
@@ -10,6 +12,7 @@ import std.convert.*
 import std.collection.*
 import std.collection.concurrent.ConcurrentHashMap
 import std.unicode.*
+import std.sync.Mutex
 import stdx.encoding.json.*
 
 private enum RPCMessageType {
@@ -22,102 +25,113 @@ private enum RPCMessageType {
  * JSON-RPC 2.0 Client for LSP communication
  */
 public class JSONRPCClient {
-    private var process: SubProcess
+    private var process: ManagedOwnedChild
     private var reader: StringReader<InputStream>
     private var writer: StringWriter<OutputStream>
     private var nextId: Int64 = 1
     private let pendingRequests = ConcurrentHashMap<Int64, Promise<JsonValue>>()
     private var workerFuture: Option<Future<Unit>> = None
+    private var stderrFuture: Option<Future<Unit>> = None
+    private let sendLock = Mutex()
+    private let writerLock = Mutex()
+    private let cleanupLock = Mutex()
+    private var shutdownFuture = None<Future<Bool>>
+    private var closing = false
+    private var closed = false
+    private var receiverStopped = false
+    private var receiverStatus = ""
 
     public init(serverPath: String, serverArgs!: Array<String> = Array<String>()) {
+        var launched = None<ManagedOwnedChild>
         try {
-            this.process = launch(
-                serverPath, serverArgs,
-                stdIn: ProcessRedirect.Pipe,
-                stdOut: ProcessRedirect.Pipe,
-                stdErr: ProcessRedirect.Pipe
-            )
-            this.reader = StringReader<InputStream>(this.process.stdOutPipe)
-            this.writer = StringWriter(this.process.stdInPipe)
-            LogUtils.info("JSON-RPC client started for server: ${serverPath}")
-        } catch (ex: Exception) {
-            LogUtils.error("Failed to start JSON-RPC server ${serverPath}: ${ex}")
-            throw Exception("Failed to start LSP server: ${ex.message}")
-        }
-        this.workerFuture = spawn {
-            this.doReceiving()
+            let child = managedRecoveryLaunchOwned(serverPath, serverArgs,
+                stdIn: ProcessRedirect.Pipe, stdOut: ProcessRedirect.Pipe, stdErr: ProcessRedirect.Pipe)
+            launched = Some(child)
+            this.process = child
+            this.reader = StringReader<InputStream>(child.stdOutPipe)
+            this.writer = StringWriter(child.stdInPipe)
+            this.stderrFuture = Some(spawn {
+                let buffer = Array<Byte>(8192, repeat: 0)
+                try { while (child.stdErrPipe.read(buffer) > 0) { () } } catch (_: Exception) { () }
+            })
+            this.workerFuture = Some(spawn { this.doReceiving() })
+        } catch (_: Exception) {
+            if (let Some(child) <- launched) {
+                try { child.terminate(force: true); let _ = child.wait(timeout: Some(Duration.second * 2)) }
+                catch (_: Exception) { () }
+                child.closeStreams()
+                if (let Some(worker) <- this.stderrFuture) { try { let _ = worker.get(Duration.second * 2) } catch (_: Exception) { () } }
+            }
+            throw Exception("lsp_process_initialization_failed")
         }
     }
 
     public func sendRequest(method: String, params!: Option<JsonObject> = None): JsonValue {
-        let requestId = this.nextId
-        this.nextId = this.nextId + 1
-        let request = LSPRequest(
-            id: requestId,
-            method: method,
-            params: params
-        )
+        this.sendRequestInternal(method, params, false)
+    }
 
-        let requestJson = request.toJsonValue()
-        let requestStr = requestJson.toString()
-        LogUtils.debug("Sending request: ${requestStr}")
-
-        // Send with LSP protocol headers
-        let contentBytes = requestStr.toArray()
-        let header = "Content-Length: ${contentBytes.size}\r\n\r\n"
-
-        // Write headers and content
-        try {
-            this.writer.write(header)
-            this.writer.write(requestStr)
-            this.writer.flush()
-        } catch (ex: Exception) {
-            LogUtils.error("Failed to send JSON-RPC request: ${ex}")
-            throw Exception("Failed to send request: ${ex.message}")
-        }
-
-        // Read response:
-        // 1. Register the pending request
+    private func sendRequestInternal(method: String, params: ?JsonObject, shutdown: Bool): JsonValue {
         let promise = Promise<JsonValue>()
-        this.pendingRequests.add(requestId, promise)
-        // 2. Wait for the response
-        let resp = promise.get()
-        LogUtils.debug("Received response: ${resp.toJsonString()}")
-        return resp
+        let reservation = synchronized(this.sendLock) {
+            if (this.closed || this.receiverStopped || (this.closing && !shutdown)) { throw Exception("lsp_client_closed") }
+            let requestId = this.nextId
+            this.nextId += 1
+            let text = LSPRequest(id: requestId, method: method, params: params).toJsonValue().toString()
+            this.pendingRequests.add(requestId, promise)
+            (requestId, text)
+        }
+        try {
+            synchronized(this.writerLock) {
+                synchronized(this.sendLock) {
+                    if (this.closed || this.receiverStopped || (this.closing && !shutdown)) { throw Exception("lsp_client_closed") }
+                }
+                this.writer.write("Content-Length: ${reservation[1].toArray().size}\r\n\r\n")
+                this.writer.write(reservation[1])
+                this.writer.flush()
+            }
+        } catch (_: Exception) {
+            synchronized(this.sendLock) {
+                this.pendingRequests.remove(reservation[0])
+                promise.reject("lsp_request_send_failed")
+            }
+        }
+        promise.get()
     }
 
     public func sendNotification(method: String, params!: Option<JsonObject> = None): Unit {
-        let notification = LSPNotification(
-            method: method,
-            params: params
-        )
+        synchronized(this.writerLock) {
+            synchronized(this.sendLock) {
+                if (this.closed || this.closing) { throw Exception("lsp_client_closed") }
+            }
+            this.writeNotification(method, params)
+        }
+    }
 
-        let notificationJson = notification.toJsonValue()
-        let notificationStr = notificationJson.toString()
-        LogUtils.debug("Sending notification: ${notificationStr}")
+    private func writeNotification(method: String, params: ?JsonObject): Unit {
+        let text = LSPNotification(method: method, params: params).toJsonValue().toString()
+        this.writer.write("Content-Length: ${text.toArray().size}\r\n\r\n")
+        this.writer.write(text)
+        this.writer.flush()
+    }
 
-        // Send with LSP protocol headers
-        let contentBytes = notificationStr.toArray()
-        let header = "Content-Length: ${contentBytes.size}\r\n\r\n"
-
-        try {
-            this.writer.write(header)
-            this.writer.write(notificationStr)
-            this.writer.flush()
-        } catch (ex: Exception) {
-            LogUtils.error("Failed to send JSON-RPC notification: ${ex}")
-            throw Exception("Failed to send notification: ${ex.message}")
+    private func rejectPending(): Unit {
+        for ((id, promise) in this.pendingRequests) {
+            this.pendingRequests.remove(id)
+            promise.reject("lsp_receiver_closed")
         }
     }
 
     private func doReceiving(): Unit {
-        while (true) {
-            if (Thread.currentThread.hasPendingCancellation) {
-                break
+        try {
+            while (true) { this.handleMessage(this.parseMessage(this.readMessage())) }
+        } catch (error: Exception) {
+            synchronized(this.sendLock) {
+                this.receiverStopped = true
+                this.receiverStatus = if (error.message == "lsp_invalid_response_encoding" || error.message == "lsp_malformed_json" || error.message == "lsp_response_eof") {
+                    error.message
+                } else { "lsp_receiver_closed" }
+                this.rejectPending()
             }
-            let message = this.readMessage()
-            let rpcMessage = this.parseMessage(message)
-            this.handleMessage(rpcMessage)
         }
     }
 
@@ -142,14 +156,13 @@ public class JSONRPCClient {
                 case Some(length) =>
                     // Read the JSON content
                     let content = this.readContent(length)
-                    LogUtils.trace("Received content: ${content}")
-                    return JsonValue.fromStr(content)
+                    return try { JsonValue.fromStr(content) } catch (_: Exception) { throw Exception("lsp_malformed_json") }
                 case _ =>
                     throw Exception("Missing Content-Length header in LSP response")
             }
         } catch (ex: Exception) {
-            LogUtils.error("Failed to read JSON-RPC response: ${ex}")
-            throw Exception("Failed to read response: ${ex.message}")
+            if (ex.message == "lsp_invalid_response_encoding" || ex.message == "lsp_malformed_json" || ex.message == "lsp_response_eof") { throw ex }
+            throw Exception("lsp_response_failed")
         }
     }
 
@@ -226,8 +239,8 @@ public class JSONRPCClient {
     private func readLine(): String {
         return try {
             this.reader.readln() ?? String.empty
-        } catch (ex: Exception) {
-            String.empty
+        } catch (_: Exception) {
+            throw Exception("lsp_invalid_response_encoding")
         }
     }
 
@@ -238,34 +251,65 @@ public class JSONRPCClient {
         while (bytesRead < length) {
             let charOption = try {
                 this.reader.read()
-            } catch (ex: Exception) {
-                break
+            } catch (_: Exception) {
+                throw Exception("lsp_invalid_response_encoding")
             }
             match (charOption) {
                 case Some(char) =>
+                    bytesRead += String([char]).size
+                    if (bytesRead > length) { throw Exception("lsp_malformed_json") }
                     contentBuilder.append(char)
-                    bytesRead++
-                case _ => break
+                case _ => throw Exception("lsp_response_eof")
             }
         }
 
         return contentBuilder.toString()
     }
 
-    public func close(): Unit {
-        try {
-            // Stop the worker thread
-            this.workerFuture?.cancel()
-            // Send shutdown request
-            this.sendRequest("shutdown", params: None)
-            // Send exit notification
-            this.sendNotification("exit")
+    func receiverStatusForTest(): String { synchronized(this.sendLock) { this.receiverStatus } }
 
-            // Wait for process to finish
-            let _ = this.process.wait()
-            LogUtils.info("JSON-RPC client closed")
-        } catch (ex: Exception) {
-            LogUtils.error("Error during JSON-RPC client shutdown: ${ex}")
+    func closedForTest(): Bool { synchronized(this.sendLock) { this.closed } }
+
+    public func close(): Unit { synchronized(this.cleanupLock) { this.closeClient() } }
+
+    private func closeClient(): Unit {
+        let shouldClose = synchronized(this.sendLock) {
+            if (this.closed) { false } else { this.closing = true; true }
+        }
+        if (!shouldClose) { return }
+        var reaped = false
+        try {
+            if (this.shutdownFuture.isNone()) {
+                this.shutdownFuture = Some(spawn {
+                    try {
+                        let _ = this.sendRequestInternal("shutdown", None, true)
+                        synchronized(this.writerLock) { this.writeNotification("exit", None) }
+                        true
+                    } catch (_: Exception) { false }
+                })
+            }
+            if (!this.shutdownFuture.getOrThrow().get(Duration.second * 2)) { throw Exception("lsp_shutdown_failed") }
+            let _ = this.process.wait(timeout: Some(Duration.second * 2))
+            reaped = true
+        } catch (_: Exception) {
+            try { this.process.terminate(force: true); let _ = this.process.wait(timeout: Some(Duration.second * 2)); reaped = true }
+            catch (_: Exception) { () }
+        } finally {
+            this.process.closeStreams()
+            this.rejectPending()
+            var joined = true
+            if (let Some(worker) <- this.shutdownFuture) {
+                try { let _ = worker.get(Duration.second * 2) } catch (_: Exception) { joined = false }
+            }
+            for (worker in [this.workerFuture, this.stderrFuture]) {
+                if (let Some(value) <- worker) {
+                    try { let _ = value.get(Duration.second * 2) } catch (_: Exception) { joined = false }
+                }
+            }
+            this.process.closeStreams()
+            let streamsClosed = this.process.streamsAreClosed()
+            synchronized(this.sendLock) { this.closed = reaped && joined && streamsClosed; this.closing = !this.closed }
+            if (!reaped || !joined || !streamsClosed) { throw Exception("lsp_cleanup_pending") }
         }
     }
 }

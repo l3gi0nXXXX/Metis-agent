@@ -1,7 +1,10 @@
 package metis.core.tools
 
+import metis.process.{ManagedOwnedChild, managedRecoveryLaunchOwned}
+
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
+import magic.log.LogUtils
 
 import metis.core.{gatewayCurrentToolRuntimeContext, gatewayMessagePayloadPreview, gatewaySubagentCreateRunRecord, gatewaySubagentEvaluateSpawnPolicy, gatewaySubagentFindRunBySessionKey, gatewaySubagentMarkRunCancelled, gatewaySubagentMarkRunFailed, gatewaySubagentMarkRunRunning, gatewaySubagentMarkRunState, gatewaySubagentMarkRunSucceeded, gatewaySubagentPolicyDecisionToJson, gatewaySubagentPolicyRejectionJson, gatewaySubagentResolveRunRecord, gatewaySubagentRunRecordInt, gatewaySubagentRunRecordString, gatewaySubagentWriteRunRecord, parseGatewayPollParts, renderGatewayAudioText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPinText, renderGatewayPollTextAdvanced, renderGatewayReactionText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayUnpinText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText, resolveRuntimeToolPolicyFromRoot, runtimeSubagentBoundaryDecision, runtimeToolPolicyReportToJson}
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager}
@@ -20,16 +23,29 @@ import std.core.Duration
 import std.fs.{exists, Path, Directory, File, OpenMode}
 import std.io.*
 import std.process.*
-import std.sync.Mutex
+import std.sync.{Mutex, Condition}
 import std.time.*
 
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
+
+private class ManagedSubagentPublication {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var published = false
+    init() { synchronized(this.lock) { this.condition = this.lock.condition() } }
+    func awaitPublished(): Unit {
+        synchronized(this.lock) { while (!this.published) { this.condition.wait() } }
+    }
+    func publish(): Unit {
+        synchronized(this.lock) { this.published = true; this.condition.notifyAll() }
+    }
+}
 
 private let managedSubagentLock = Mutex()
 private var managedSubagentAgentIds = HashMap<String, String>()
 private var managedSubagentStates = HashMap<String, String>()
 private var managedSubagentFutures = HashMap<String, Future<Unit>>()
-private var managedSubagentProcesses = HashMap<String, SubProcess>()
+private var managedSubagentProcesses = HashMap<String, ManagedOwnedChild>()
 private var sessionsSendRuntimeRunnerForTest: Option<(String, String) -> String> = None<(String, String) -> String>
 
 /**
@@ -929,8 +945,6 @@ public class GatewaySessionsToolset {
         synchronized(managedSubagentLock) {
             managedSubagentAgentIds.remove(sessionKey)
             managedSubagentStates.remove(sessionKey)
-            managedSubagentFutures.remove(sessionKey)
-            managedSubagentProcesses.remove(sessionKey)
         }
     }
 
@@ -946,15 +960,26 @@ public class GatewaySessionsToolset {
         }
     }
 
-    private func setManagedSubagentProcess(sessionKey: String, process: SubProcess): Unit {
+    private func setManagedSubagentProcess(sessionKey: String, process: ManagedOwnedChild): Unit {
         synchronized(managedSubagentLock) {
             managedSubagentProcesses.add(sessionKey, process)
         }
     }
 
     private func clearManagedSubagentProcess(sessionKey: String): Unit {
-        synchronized(managedSubagentLock) {
-            managedSubagentProcesses.remove(sessionKey)
+        let child = synchronized(managedSubagentLock) { managedSubagentProcesses.get(sessionKey) }
+        match (child) {
+            case Some(process) =>
+                var reaped = false
+                try { if (process.isAlive()) { process.terminate(force: true) }; let _ = process.wait(timeout: Some(Duration.second * 5)); reaped = true }
+                catch (_: Exception) { () }
+                process.closeStreams()
+                if (reaped && process.streamsAreClosed()) {
+                    synchronized(managedSubagentLock) {
+                        if (managedSubagentProcesses.get(sessionKey)?.pid == Some(process.pid)) { managedSubagentProcesses.remove(sessionKey) }
+                    }
+                }
+            case None => ()
         }
     }
 
@@ -1289,7 +1314,12 @@ public class GatewaySessionsToolset {
             "system",
             "acp dispatch accepted: harness=${resolvedHarness}, mode=${effectiveMode}, sandbox=${effectiveSandbox}, sessionPersistence=${effectiveSessionPersistence}"
         )
+        let publication = ManagedSubagentPublication()
         let future = spawn {
+            publication.awaitPublished()
+            var ownedProcess = None<ManagedOwnedChild>
+            var ownedStdout = None<Future<String>>
+            var ownedStderr = None<Future<String>>
             let _ = gatewaySubagentMarkRunRunning(st.sessionsRoot(), sessionKey)
             this.setManagedSubagentState(sessionKey, "running")
             st.appendTranscriptEntry(
@@ -1298,22 +1328,29 @@ public class GatewaySessionsToolset {
                 "acp started: harness=${resolvedHarness}, mode=${effectiveMode}, sandbox=${effectiveSandbox}, sessionPersistence=${effectiveSessionPersistence}"
             )
             try {
-                let process = launch(
+                if (Thread.currentThread.hasPendingCancellation) {
+                    this.setManagedSubagentState(sessionKey, "cancelled", error: "cancelled")
+                    return
+                }
+                let process = managedRecoveryLaunchOwned(
                     if (withWrap) { "sh" } else { command[0] },
                     if (withWrap) { ["-c", String.join(command, delimiter: " ")] } else { if (command.size > 1) { command[1..] } else { [] } },
                     stdOut: ProcessRedirect.Pipe,
                     stdErr: ProcessRedirect.Pipe,
                     workingDirectory: Some(effectiveCwd)
                 )
+                ownedProcess = Some(process)
                 this.setManagedSubagentProcess(sessionKey, process)
                 let stdoutFuture = spawn {
                     let reader = StringReader(process.stdOutPipe)
                     try { reader.readToEnd() } catch (_: Exception) { "" }
                 }
+                ownedStdout = Some(stdoutFuture)
                 let stderrFuture = spawn {
                     let reader = StringReader(process.stdErrPipe)
                     try { reader.readToEnd() } catch (_: Exception) { "" }
                 }
+                ownedStderr = Some(stderrFuture)
                 var exitCode: Int64 = 0
                 var timedOut = false
                 try {
@@ -1354,12 +1391,27 @@ public class GatewaySessionsToolset {
                     this.setManagedSubagentState(sessionKey, "failed", error: "acp failed: ${e.message}", exitCode: 1)
                 }
             } finally {
-                this.clearManagedSubagentProcess(sessionKey)
-                this.clearManagedSubagentFuture(sessionKey)
-                this.maybeDeleteManagedSessionAfterRun(sessionKey)
+                var cleanupSettled = true
+                if (let Some(process) <- ownedProcess) {
+                    try { if (process.isAlive()) { process.terminate(force: true) }; let _ = process.wait(timeout: Some(Duration.second * 5)) }
+                    catch (_: Exception) { cleanupSettled = false }
+                    process.closeStreams()
+                    for (worker in [ownedStdout, ownedStderr]) {
+                        if (let Some(value) <- worker) {
+                            try { let _ = value.get(Duration.second * 5) } catch (_: Exception) { cleanupSettled = false }
+                        }
+                    }
+                    process.closeStreams()
+                    if (!process.streamsAreClosed()) { cleanupSettled = false }
+                }
+                if (cleanupSettled) {
+                    this.clearManagedSubagentProcess(sessionKey)
+                    this.clearManagedSubagentFuture(sessionKey)
+                    this.maybeDeleteManagedSessionAfterRun(sessionKey)
+                } else { LogUtils.error("managed_subagent_cleanup_pending") }
             }
         }
-        this.setManagedSubagentFuture(sessionKey, future)
+        try { this.setManagedSubagentFuture(sessionKey, future) } finally { publication.publish() }
         return true
     }
 
@@ -1380,7 +1432,12 @@ public class GatewaySessionsToolset {
         let prompt = this.buildManagedSubagentPrompt(task, cwdHint, sessionKey, normalized)
         let st = this.gwStore()
         st.appendTranscriptEntry(sessionKey, "system", "subagent dispatch accepted: agentId=${normalized}")
+        let publication = ManagedSubagentPublication()
         let future = spawn {
+            publication.awaitPublished()
+            var ownedProcess = None<ManagedOwnedChild>
+            var ownedStdout = None<Future<String>>
+            var ownedStderr = None<Future<String>>
             this.setManagedSubagentState(sessionKey, "running")
             st.appendTranscriptEntry(sessionKey, "system", "subagent started: agentId=${normalized}")
             try {
@@ -1390,13 +1447,14 @@ public class GatewaySessionsToolset {
                     return
                 }
                 let (cmd, args, workDir) = this.internalSubagentCommandSpec(sessionKey, normalized, prompt, cwdHint)
-                let process = launch(
+                let process = managedRecoveryLaunchOwned(
                     cmd,
                     args,
                     stdOut: ProcessRedirect.Pipe,
                     stdErr: ProcessRedirect.Pipe,
                     workingDirectory: Some(workDir)
                 )
+                ownedProcess = Some(process)
                 this.setManagedSubagentProcess(sessionKey, process)
                 let timeout: Option<Duration> = if (runTimeoutSeconds > 0) {
                     Some(Duration.second * runTimeoutSeconds)
@@ -1407,10 +1465,12 @@ public class GatewaySessionsToolset {
                     let reader = StringReader(process.stdOutPipe)
                     try { reader.readToEnd() } catch (_: Exception) { "" }
                 }
+                ownedStdout = Some(stdoutFuture)
                 let stderrFuture = spawn {
                     let reader = StringReader(process.stdErrPipe)
                     try { reader.readToEnd() } catch (_: Exception) { "" }
                 }
+                ownedStderr = Some(stderrFuture)
                 var exitCode: Int64 = 0
                 var timedOut = false
                 try {
@@ -1456,12 +1516,27 @@ public class GatewaySessionsToolset {
                     this.setManagedSubagentState(sessionKey, "failed", error: "subagent failed: ${e.message}", exitCode: 1)
                 }
             } finally {
-                this.clearManagedSubagentProcess(sessionKey)
-                this.clearManagedSubagentFuture(sessionKey)
-                this.maybeDeleteManagedSessionAfterRun(sessionKey)
+                var cleanupSettled = true
+                if (let Some(process) <- ownedProcess) {
+                    try { if (process.isAlive()) { process.terminate(force: true) }; let _ = process.wait(timeout: Some(Duration.second * 5)) }
+                    catch (_: Exception) { cleanupSettled = false }
+                    process.closeStreams()
+                    for (worker in [ownedStdout, ownedStderr]) {
+                        if (let Some(value) <- worker) {
+                            try { let _ = value.get(Duration.second * 5) } catch (_: Exception) { cleanupSettled = false }
+                        }
+                    }
+                    process.closeStreams()
+                    if (!process.streamsAreClosed()) { cleanupSettled = false }
+                }
+                if (cleanupSettled) {
+                    this.clearManagedSubagentProcess(sessionKey)
+                    this.clearManagedSubagentFuture(sessionKey)
+                    this.maybeDeleteManagedSessionAfterRun(sessionKey)
+                } else { LogUtils.error("managed_subagent_cleanup_pending") }
             }
         }
-        this.setManagedSubagentFuture(sessionKey, future)
+        try { this.setManagedSubagentFuture(sessionKey, future) } finally { publication.publish() }
         return true
     }
 
@@ -1728,6 +1803,10 @@ public class GatewaySessionsToolset {
         timeoutSeconds: Option<Int64>
     ): String {
         this.sessionsSendA2AImpl(sessionKey, label, agentId, message, timeoutSeconds)
+    }
+
+    public func debugManagedSubagentOwnerCountsForTest(): (Int64, Int64) {
+        synchronized(managedSubagentLock) { (managedSubagentProcesses.size, managedSubagentFutures.size) }
     }
 
     public func debugSetSessionsSendRuntimeRunnerForTest(runner: Option<(String, String) -> String>): Unit {

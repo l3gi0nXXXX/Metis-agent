@@ -5,7 +5,8 @@ import magic.prelude.*
 import magic.log.LogUtils
 import magic.jsonable.ToJsonValue
 
-import metis.lsp.{LSPClient, DocumentSymbol}
+import metis.lsp.{LSPClient, DocumentSymbol, registerLspProcessRecoveryOwner}
+import metis.process.managedRecoveryContext
 import metis.core.config.CliConfig
 import metis.core.tools.lsp_utils.LSPManager
 import metis.io.PrintUtils
@@ -28,6 +29,10 @@ public class LSPToolset {
      * Singleton LSP Manager instance
      */
     private static var _lspManager: Option<LSPManager> = None
+    private static let managerOwnerLock = Mutex()
+    private static var managerOwnerContext = ("", "")
+    private static var pendingInitializationClient = None<LSPClient>
+    private static var pendingInitializationContext = ("", "")
 
     private static prop globalLSPManager: LSPManager {
         get() {
@@ -40,22 +45,71 @@ public class LSPToolset {
     }
 
     protected static func initialize(): Bool {
-        try {
-            LogUtils.info("🔧 New LSP Client...")
-            let lspArgs = ["--enable-log=true", "--log-path=${CliConfig.logsDir.join("LSPServer.log")}"]
-            let client = LSPClient("LSPServer", serverArgs: lspArgs)
+        synchronized(LSPToolset.managerOwnerLock) {
+            if (LSPToolset._lspManager.isSome()) { return true }
+            let context = managedRecoveryContext()
+            if (let Some(client) <- LSPToolset.pendingInitializationClient) {
+                if (LSPToolset.pendingInitializationContext != context) { return false }
+                try { client.close() } catch (_: Exception) { return false }
+                LSPToolset.pendingInitializationClient = None<LSPClient>
+                LSPToolset.pendingInitializationContext = ("", "")
+            }
+            var pendingClient = None<LSPClient>
+            try {
+                LogUtils.info("🔧 New LSP Client...")
+                let lspArgs = ["--enable-log=true", "--log-path=${CliConfig.logsDir.join("LSPServer.log")}"]
+                let client = LSPClient("LSPServer", serverArgs: lspArgs)
+                pendingClient = Some(client)
 
-            LogUtils.info("🔧 Initialize LSP Client, working dir: ${CliConfig.cwd.toString()}")
-            client.initialize(root: CliConfig.cwd)
+                LogUtils.info("🔧 Initialize LSP Client, working dir: ${CliConfig.cwd.toString()}")
+                client.initialize(root: CliConfig.cwd)
 
-            LogUtils.info("✅ LSP Client initialized successfully")
+                LogUtils.info("✅ LSP Client initialized successfully")
 
-            LSPToolset._lspManager = LSPManager(client)
-            return true
-        } catch (ex: Exception) {
-            LogUtils.error("❌ LSP Client initialization failed: ${ex}")
-            LogUtils.error("Error details: ${ex.message}")
-            return false
+                LSPToolset._lspManager = LSPManager(client)
+                LSPToolset.managerOwnerContext = context
+                registerLspProcessRecoveryOwner(context, { owner => LSPToolset.closeRecoveryOwner(owner) })
+                return true
+            } catch (_: Exception) {
+                if (let Some(client) <- pendingClient) {
+                    try { client.close() } catch (_: Exception) {
+                        LSPToolset.pendingInitializationClient = Some(client)
+                        LSPToolset.pendingInitializationContext = context
+                        registerLspProcessRecoveryOwner(context, { owner => LSPToolset.closeRecoveryOwner(owner) })
+                    }
+                }
+                LogUtils.error("lsp_initialization_failed")
+                return false
+            }
+        }
+    }
+
+    public static func closeRecoveryOwner(context: (String, String)): Bool {
+        synchronized(LSPToolset.managerOwnerLock) {
+            if (context[0].isEmpty()) { return true }
+            if (LSPToolset.pendingInitializationContext == context) {
+                if (let Some(client) <- LSPToolset.pendingInitializationClient) {
+                    try { client.close() } catch (_: Exception) { return false }
+                    LSPToolset.pendingInitializationClient = None<LSPClient>
+                    LSPToolset.pendingInitializationContext = ("", "")
+                }
+            }
+            if (LSPToolset.managerOwnerContext != context) { return true }
+            match (LSPToolset._lspManager) {
+                case Some(manager) =>
+                    try { manager.close() } catch (_: Exception) { return false }
+                    LSPToolset._lspManager = None<LSPManager>
+                    LSPToolset.managerOwnerContext = ("", "")
+                case None => ()
+            }
+            true
+        }
+    }
+
+    public static func debugRecoveryOwnerForTest(): ((String, String), Bool) {
+        synchronized(LSPToolset.managerOwnerLock) {
+            if (LSPToolset.pendingInitializationClient.isSome()) { (LSPToolset.pendingInitializationContext, true) }
+            else { (LSPToolset.managerOwnerContext, LSPToolset._lspManager.isSome()) }
         }
     }
 

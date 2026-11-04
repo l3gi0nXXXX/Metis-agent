@@ -1,5 +1,9 @@
 package metis.sandbox
 
+import metis.process.{managedRecoveryLaunchOwned, managedRecoveryWaitForCommand}
+
+import metis.process.managedRecoveryExecuteWithOutput
+
 import magic.log.LogUtils
 import metis.core.config.CliConfig
 import metis.utils.{InfoUtils, StringUtils}
@@ -58,8 +62,10 @@ func startContainerSandbox(config: SandboxConfig, cliArgs: Array<String>): Int64
     // Generate container name
     let imageName = parseImageName(image)
 
-    let (_, containerOutput, _) = executeWithOutput(config.command, ["ps", "-a", "--format", "{{.Names}}"])
-    let containerList = String.fromUtf8(containerOutput).split("\n") |>
+    let (_, containerOutput, _) = managedRecoveryExecuteWithOutput(config.command, ["ps", "-a", "--format", "{{.Names}}"])
+    let containerText = try { String.fromUtf8(containerOutput) }
+        catch (_: Exception) { throw FatalSandboxError("sandbox_invalid_response_encoding") }
+    let containerList = containerText.split("\n") |>
         map { c => c.trimAscii() } |>
         collectArray
 
@@ -101,8 +107,8 @@ func startContainerSandbox(config: SandboxConfig, cliArgs: Array<String>): Int64
         args.add("--user")
         args.add("root")
 
-        let uidResult = executeWithOutput("id", ["-u"])
-        let gidResult = executeWithOutput("id", ["-g"])
+        let uidResult = managedRecoveryExecuteWithOutput("id", ["-u"])
+        let gidResult = managedRecoveryExecuteWithOutput("id", ["-g"])
         let (_, uidOutput, _) = uidResult
         let (_, gidOutput, _) = gidResult
         let uid = uidOutput.toString().trimAscii()
@@ -131,9 +137,9 @@ func startContainerSandbox(config: SandboxConfig, cliArgs: Array<String>): Int64
     LogUtils.info("Running container command: ${config.command} ${String.join(sandboxArgs, delimiter: " ")}")
 
     // Start sandbox process
-    let sandboxProcess = launch(config.command, sandboxArgs, stdIn: Inherit, stdOut: Inherit, stdErr: Inherit)
+    let sandboxProcess = managedRecoveryLaunchOwned(config.command, sandboxArgs, stdIn: Inherit, stdOut: Inherit, stdErr: Inherit)
 
-    return sandboxProcess.wait()
+    try { managedRecoveryWaitForCommand(sandboxProcess) } finally { sandboxProcess.closeStreams() }
 }
 
 /**
@@ -227,42 +233,32 @@ private func buildEntrypoint(workdir: String, cliArgs: Array<String>): Array<Str
 /**
  * Check if Docker/Podman image exists
  */
-private func imageExists(sandbox: String, image: String): Bool {
-    let args = ["images", "-q", image]
-    let process = launch(sandbox, args, stdOut: Pipe, stdErr: Pipe)
-
-    let reader = StringReader(process.stdOutPipe)
-    let stdoutData = reader.readToEnd()
-
-    let exitCode = process.wait()
-    return exitCode == 0 && !stdoutData.trimAscii().isEmpty()
+func imageExists(sandbox: String, image: String): Bool {
+    let (exitCode, stdout, _) = managedRecoveryExecuteWithOutput(sandbox, ["images", "-q", image])
+    let text = try { String.fromUtf8(stdout) } catch (_: Exception) {
+        LogUtils.error("sandbox_invalid_response_encoding")
+        return false
+    }
+    exitCode == 0 && !text.trimAscii().isEmpty()
 }
 
 /**
  * Pull Docker/Podman image
  */
-private func pullImage(sandbox: String, image: String): Bool {
+func pullImage(sandbox: String, image: String): Bool {
     LogUtils.info("Attempting to pull image ${image} using ${sandbox}...")
-    let process = launch(sandbox, ["pull", image], stdOut: Pipe, stdErr: Pipe)
-
-    let stdoutReader = StringReader(process.stdOutPipe)
-    let stdoutData = stdoutReader.readToEnd()
-
-    let stderrReader = StringReader(process.stdErrPipe)
-    let stderrData = stderrReader.readToEnd()
-
-    let exitCode = process.wait()
-
+    let (exitCode, _, stderr) = managedRecoveryExecuteWithOutput(sandbox, ["pull", image])
+    // Validate external text without reflecting untrusted command output into diagnostics.
+    try { let _ = String.fromUtf8(stderr) } catch (_: Exception) {
+        LogUtils.error("sandbox_invalid_response_encoding")
+        return false
+    }
     if (exitCode == 0) {
         LogUtils.info("Successfully pulled image ${image}.")
         return true
-    } else {
-        LogUtils.error("Failed to pull image ${image}. Exit code: ${exitCode}")
-        if (!stderrData.trimAscii().isEmpty()) {
-            LogUtils.error("Error: ${stderrData.trimAscii()}")
-        }
-        return false
     }
+    LogUtils.error("sandbox_pull_failed exitCode=${exitCode}")
+    false
 }
 
 /**

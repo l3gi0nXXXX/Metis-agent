@@ -1,11 +1,13 @@
 package metis.sandbox
 
+import metis.process.{managedRecoveryLaunchOwned, managedRecoveryWaitForCommand}
+
 import metis.core.config.CliConfig
 import magic.log.LogUtils
 
 import std.fs.*
 import std.collection.{HashMap, ArrayList}
-import std.process.launch
+import std.process.ProcessRedirect
 import std.env.{getVariable, getVariables, getCommand}
 
 /**
@@ -59,7 +61,8 @@ func startMacOSSandbox(config: SandboxConfig, cliArgs: Array<String>): Int64 {
     LogUtils.trace("[sandbox] ${config.command} ${String.join(sandboxExecArgs, delimiter: " ")}")
     // println("[sandbox] ${config.command} ${String.join(sandboxExecArgs, delimiter: " ")}")
     // Start sandbox process
-    let sandboxProcess = launch(config.command, sandboxExecArgs, stdIn: Inherit, stdOut: Inherit, stdErr: Inherit)
+    let sandboxProcess = managedRecoveryLaunchOwned(config.command, sandboxExecArgs,
+        stdIn: ProcessRedirect.Inherit, stdOut: ProcessRedirect.Inherit, stdErr: ProcessRedirect.Inherit)
 
-    return sandboxProcess.wait()
+    try { managedRecoveryWaitForCommand(sandboxProcess) } finally { sandboxProcess.closeStreams() }
 }
