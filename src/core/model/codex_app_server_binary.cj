@@ -1,7 +1,8 @@
 package metis.core.model
 
+import metis.process.managedRecoveryExecuteWithOutput
+
 import std.convert.Parsable
-import std.process.executeWithOutput
 import std.regex.Regex
 
 public let CODEX_APP_SERVER_MIN_VERSION = "0.125.0"
@@ -101,7 +102,7 @@ public func checkCodexAppServerBinary(
     }
 
     try {
-        let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput(cleanCommand, ["--version"])
+        let (exitCode, stdoutBytes, stderrBytes) = managedRecoveryExecuteWithOutput(cleanCommand, ["--version"])
         let stdout = codexBinaryDecode(stdoutBytes)
         let stderr = codexBinaryDecode(stderrBytes)
         let combined = "${stdout}\n${stderr}".trimAscii()

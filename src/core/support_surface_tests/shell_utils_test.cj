@@ -3,6 +3,7 @@ package metis.core.support_surface_tests
 import metis.utils.*
 import metis.process.{ManagedStdioBrokerClient, ManagedStdioOwnerSpec, managedStdioResolveBrokerScriptPath}
 import std.collection.ArrayList
+import std.env.{getProcessId, getVariable, removeVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.sync.*
 import std.time.*
@@ -522,6 +523,52 @@ public class ShellUtilsTest {
         } finally {
             debugSetShellBrokerProviderForTest(None<() -> ManagedStdioBrokerClient>)
             let _ = client.close(timeoutMs: 3000)
+        }
+    }
+}
+
+@When[os == "macOS"]
+foreign { func proc_pidinfo(pid: Int32, flavor: Int32, arg: UInt64, buffer: CPointer<UInt64>, size: Int32): Int32 }
+
+@When[os == "macOS"]
+private func shellArtifactFdCount(): Int64 {
+    let buffer = unsafe { LibC.malloc<UInt64>(count: 4096) }
+    try {
+        let bytes = unsafe { proc_pidinfo(Int32(getProcessId()), 1, 0, buffer, 32768) }
+        if (bytes <= 0 || bytes >= 32768 || bytes % 8 != 0) { throw Exception("fd_observation_failed") }
+        Int64(bytes / 8)
+    } finally { unsafe { LibC.free(buffer) } }
+}
+
+@When[os == "macOS"]
+@Test
+public class ShellInternalArtifactTest {
+    @TestCase
+    public func shellArtP1UsesInjectedClientWithoutGlobalAssetRequirement(): Unit {
+        let home = Directory.createTemp("/private/tmp")
+        let previous = getVariable("METIS_STDIO_BROKER_SCRIPT")
+        let script = home.join("broker 中文😀.mjs")
+        File.writeTo(script, "not executed".toArray())
+        let client = ManagedStdioBrokerClient(brokerScriptPath: script.toString())
+        let baseline = shellArtifactFdCount()
+        let prior = debugSetShellBrokerProviderForTest(Some({ => client }))
+        var formal = false
+        try {
+            setVariable("METIS_STDIO_BROKER_SCRIPT", home.join("missing").toString())
+            let valid = ShellUtils.capturedInternalArtifactsValid()
+            @Expect(valid, true)
+            let state = client.snapshot()
+            let unused = state.generation == 0 && !state.running && state.ownerCount == 0 && state.brokerPid == 0 &&
+                state.readerCount == 0 && state.dispatcherCount == 0 && !exists(home.join(".issued"))
+            @Expect(unused, true)
+            let sameFd = shellArtifactFdCount() == baseline
+            @Expect(sameFd, true)
+            formal = valid && unused && sameFd
+        } finally {
+            let _ = debugSetShellBrokerProviderForTest(prior)
+            match (previous) { case Some(value) => setVariable("METIS_STDIO_BROKER_SCRIPT", value) case None => removeVariable("METIS_STDIO_BROKER_SCRIPT") }
+            File.writeTo(home.join("formal-before-cleanup"), ("formal:${formal}\nno_process:true\n").toArray())
+            if (formal) { remove(home, recursive: true) }
         }
     }
 }

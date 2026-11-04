@@ -1,7 +1,8 @@
 package metis.utils
 
 import magic.log.LogUtils
-import metis.process.{ManagedStdioBrokerClient, ManagedStdioOwnerSpec, managedStdioBroker}
+import metis.process.{ManagedStdioBrokerClient, ManagedStdioOwnerSpec, managedStdioBroker,
+    managedRecoveryLaunchOwned, managedRecoveryExecuteWithOutput}
 import std.process.*
 import std.fs.Path
 import std.time.*
@@ -54,13 +55,21 @@ private func shellBrokerClient(): ManagedStdioBrokerClient {
     }
 }
 
-public func debugSetShellBrokerProviderForTest(provider: Option<() -> ManagedStdioBrokerClient>): Unit {
+public func debugSetShellBrokerProviderForTest(provider: Option<() -> ManagedStdioBrokerClient>): Option<() -> ManagedStdioBrokerClient> {
     synchronized(shellBrokerOwnerLock) {
+        let previous = shellBrokerProviderForTest
         shellBrokerProviderForTest = provider
+        previous
     }
 }
 
 public class ShellUtils {
+    /** Validates the files used by the selected captured-command client, without launching it. */
+    public static func capturedInternalArtifactsValid(requireNativeGate!: Bool = false): Bool {
+        try { shellBrokerClient().validateInternalArtifacts(requireNativeGate: requireNativeGate) }
+        catch (_: Exception) { false }
+    }
+
     private static func durationMilliseconds(timeout: Duration): Int64 {
         let nanos = timeout.toNanoseconds()
         max(1, nanos / 1000000 + if (nanos % 1000000 == 0) {
@@ -228,26 +237,18 @@ public class ShellUtils {
 
         match (timeout) {
             case None =>
-                let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput(
+                let (exitCode, stdoutBytes, stderrBytes) = managedRecoveryExecuteWithOutput(
                     cmd,
                     cmdArgs,
                     workingDirectory: workDir
                 )
-                let stdout = try {
-                    String.fromUtf8(stdoutBytes)
-                } catch (e: Exception) {
-                    LogUtils.debug("[ShellUtils] Failed to decode stdout: ${e}")
-                    ""
+                let decoded = try { (String.fromUtf8(stdoutBytes), String.fromUtf8(stderrBytes)) }
+                catch (_: Exception) {
+                    return (SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, "", SHELL_INVALID_RESPONSE_ENCODING_DIAGNOSTIC)
                 }
-                let stderr = try {
-                    String.fromUtf8(stderrBytes)
-                } catch (e: Exception) {
-                    LogUtils.debug("[ShellUtils] Failed to decode stderr: ${e}")
-                    ""
-                }
+                let (stdout, stderr) = decoded
                 if (exitCode != 0 && logFailures) {
                     LogUtils.error("Shell command execution failed: ${exitCode}")
-                    LogUtils.error("  ${cmd} ${String.join(cmdArgs, delimiter: ' ')}")
                 }
                 return (exitCode, stdout, stderr)
             case Some(_) => ()
@@ -295,7 +296,7 @@ public class ShellUtils {
         }
         var stderr = result.stderr
         let pgrepExecutable = try {
-            executeWithOutput("/bin/test", ["-x", pgrepPath])[0] == 0
+            managedRecoveryExecuteWithOutput("/bin/test", ["-x", pgrepPath])[0] == 0
         } catch (_: Exception) {
             false
         }
@@ -323,25 +324,14 @@ public class ShellUtils {
                                           withWrap!: Bool = true,
                                           usePowerShellOnWindows!: Bool = false): Int64 {
         let (cmd, cmdArgs) = buildCommandArgs(command, withWrap, usePowerShellOnWindows)
-
-        let process = launch(
-            cmd,
-            cmdArgs,
-            stdIn: Inherit,
-            stdOut: Inherit,
-            stdErr: Inherit,
-            workingDirectory: workDir
-        )
-
+        let process = managedRecoveryLaunchOwned(cmd, cmdArgs, workingDirectory: workDir,
+            stdIn: Inherit, stdOut: Inherit, stdErr: Inherit)
         try {
-            return process.wait(timeout: timeout)
-        } catch(ex: TimeoutException) {
-            try {
-                process.terminate(force: true)
-            } catch (terminateErr: Exception) {
-                LogUtils.debug("[ShellUtils] Failed to terminate interactive process after timeout: ${terminateErr}")
-            }
+            process.wait(timeout: timeout)
+        } catch (_: TimeoutException) {
+            try { process.terminate(force: true); let _ = process.wait(timeout: Some(Duration.second * 5)) }
+            catch (_: Exception) { () }
             throw ShellTimeoutException("Interactive shell command execution timed out")
-        }
+        } finally { process.closeStreams() }
     }
 }

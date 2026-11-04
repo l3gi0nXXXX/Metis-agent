@@ -1,9 +1,10 @@
 package metis.core.tools.fs_utils
 
+import metis.process.managedRecoveryExecuteWithOutput
+
 import metis.core.config.CliConfig
 
 import std.fs.{File, Directory, remove}
-import std.process.executeWithOutput
 import std.collection.ArrayList
 
 /**
@@ -21,7 +22,7 @@ protected func diff(oldContent: String, newContent: String): String {
         File.writeTo(newFile, newContent.toArray())
 
         // Try git diff first
-        let (gitExitCode, gitStdOut, gitStdErr) = executeWithOutput(
+        let (gitExitCode, gitStdOut, gitStdErr) = managedRecoveryExecuteWithOutput(
             "git",
             ["diff", "--no-index", "--color=never", oldFile.toString(), newFile.toString()]
         )
@@ -30,7 +31,7 @@ protected func diff(oldContent: String, newContent: String): String {
         }
 
         // Fallback to system diff
-        let (diffExitCode, diffStdOut, diffStdErr) = executeWithOutput(
+        let (diffExitCode, diffStdOut, diffStdErr) = managedRecoveryExecuteWithOutput(
             "diff", ["-u", oldFile.toString(), newFile.toString()]
         )
         if (diffExitCode == 1 || diffExitCode == 0) { // diff returns 1 when files differ, 0 when same

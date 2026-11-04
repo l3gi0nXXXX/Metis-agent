@@ -1,5 +1,7 @@
 package metis.core.tools.fs_utils
 
+import metis.process.managedRecoveryExecuteWithOutput
+
 import std.fs.*
 import std.process.*
 import std.io.*
@@ -42,12 +44,12 @@ public func grep(pattern: String, path: Option<String>, include: Option<String>)
 private func getRipgrepPath(): Option<String> {
     try {
         let checkCommand = if (InfoUtils.os == "windows") { "where" } else { "which" }
-        let (exitCode, stdOutData, _) = executeWithOutput(checkCommand, ["rg"])
+        let (exitCode, stdOutData, _) = managedRecoveryExecuteWithOutput(checkCommand, ["rg"])
         if (exitCode == 0) {
             let output = String.fromUtf8(stdOutData).trimAscii()
             if (!output.isEmpty() && (output.contains("rg.exe") || output.endsWith("rg"))) {
                 try {
-                    let (versionExitCode, _, _) = executeWithOutput("rg", ["--version"])
+                    let (versionExitCode, _, _) = managedRecoveryExecuteWithOutput("rg", ["--version"])
                     if (versionExitCode == 0) {
                         return Some("rg")
                     }

@@ -1,5 +1,7 @@
 package metis.gateway.tools
 
+import metis.process.managedRecoveryExecuteWithOutput
+
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
@@ -8,7 +10,6 @@ import metis.core.config.{CliSettingManager, GatewayUserSettings, MetisPaths}
 import metis.io.PrintUtils
 
 import std.fs.{Path, exists}
-import std.process.executeWithOutput
 
 import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
 
@@ -432,7 +433,7 @@ public class GatewayGatewayToolset {
             case None => ["gateway", "call", normalizedMethod]
         }
         let (exitCode, stdoutBytes, stderrBytes) = try {
-            executeWithOutput(command, args, workingDirectory: workDir)
+            managedRecoveryExecuteWithOutput(command, args, workingDirectory: workDir)
         } catch (e: Exception) {
             let err = gatewayToolRpcEnvelope(
                 normalizedMethod,

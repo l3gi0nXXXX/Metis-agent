@@ -1,5 +1,7 @@
 package metis.core.tools.cj_utils
 
+import metis.process.managedRecoveryExecuteWithOutput
+
 import magic.log.LogUtils
 import magic.utils.readFile
 import magic.dsl.jsonable
@@ -273,7 +275,7 @@ protected func cjpmBuild(projectDir: Path,
 
 private func execCommand(command: String, args: Array<String>, projectDir: Path): String {
     try {
-        let (exitCode, stdOut, stdErr) = executeWithOutput(command, args, workingDirectory: projectDir)
+        let (exitCode, stdOut, stdErr) = managedRecoveryExecuteWithOutput(command, args, workingDirectory: projectDir)
 
         if (exitCode == 0) {
             let output = String.fromUtf8(stdOut)
