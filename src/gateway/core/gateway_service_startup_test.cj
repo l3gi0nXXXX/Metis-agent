@@ -1,17 +1,21 @@
 package metis.gateway.core
 
-import metis.core.config.CliConfig
+import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock, GatewayUserSettings}
+import metis.gateway.service_plugin.*
+import metis.gateway.gitcode_plugin.{GitCodeSubscriptionStore, GitCodeSubscriptionTarget, GitCodeSubscriptionScope, setGitCodeSubscriptionStore}
+import metis.process.{resetManagedStdioBrokerForTest, managedStdioBroker}
+import std.sync.Mutex
 import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
 import metis.gateway.model.{ChannelPolicyConfig, ChannelType, ChatType, InboundMessage, OutboundMessage, SendResult}
 import magic.config.Config
 
 import std.collection.{ArrayList, HashMap}
-import std.env.{getVariable, removeVariable, setVariable}
+import std.env.{getVariable, removeVariable, setVariable, getProcessId}
 import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists, remove}
-import std.time.DateTime
+import std.time.{DateTime, MonoTime}
 import std.core.Duration
 import std.unittest.testmacro.*
-import stdx.encoding.json.JsonObject
+import stdx.encoding.json.{JsonObject, JsonString}
 
 private func withGatewayServiceStartupTestHome<T>(block: () -> T): T {
     let testHome = "/tmp/metis-gateway-service-startup-test-home"
@@ -99,6 +103,7 @@ private class GatewayServiceStartupFakeAdapter <: ChannelAdapter {
     private let startDelayMs: Int64
     private let failMessage: String
     private let stopFailure: String
+    private let onStart: Option<() -> Unit>
     private let inbound = ArrayList<InboundMessage>()
     public var startCount: Int64 = 0
     public var stopCount: Int64 = 0
@@ -109,12 +114,14 @@ private class GatewayServiceStartupFakeAdapter <: ChannelAdapter {
         adapterName: String,
         startDelayMs!: Int64 = 0,
         failMessage!: String = "",
-        stopFailure!: String = ""
+        stopFailure!: String = "",
+        onStart!: Option<() -> Unit> = None<() -> Unit>
     ) {
         this.adapterName = adapterName
         this.startDelayMs = startDelayMs
         this.failMessage = failMessage
         this.stopFailure = stopFailure
+        this.onStart = onStart
     }
 
     public prop name: String {
@@ -123,6 +130,7 @@ private class GatewayServiceStartupFakeAdapter <: ChannelAdapter {
 
     public func start(): Unit {
         this.startCount += 1
+        match (this.onStart) { case Some(callback) => callback() case None => () }
         if (this.startDelayMs > 0) {
             sleep(Duration.millisecond * this.startDelayMs)
         }
@@ -260,6 +268,104 @@ private func gatewayServiceStartupRuntimeAccount(channelId: String, accountId: S
 
 @Test
 public class GatewayServiceStartupTest {
+
+    @TestCase
+    public func startupInstallsSubscribersBeforeStartingChannelConsumer(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = Directory.createTemp("/private/tmp")
+            let oldHome = getVariable("METIS_HOME")
+            let oldLog = Config.logFile
+            let services = ArrayList<GatewayService>()
+            let errors = ArrayList<Exception>()
+            let samples = ArrayList<Bool>()
+            let sampleLock = Mutex()
+            let attempt = { action: () -> Unit => try { action() } catch (error: Exception) { errors.add(error) } }
+            let check = { value: Bool =>
+                @Expect(value, true)
+                if (!value) { throw Exception("startup_channel_order_failed") }
+            }
+            var bodyError = None<Exception>
+            var formal = false
+            try {
+                File.writeTo(home.join("startup-dispatch.owner"),
+                    "metis-startup-dispatch-v1\ntestPid:${getProcessId()}\nname:channel-order\n".toArray())
+                setVariable("METIS_HOME", home.toString())
+                CliConfig.invalidatePathCache(); MetisConfigManager.invalidate(); CliSettingManager.invalidate()
+                resetServicePluginHostForTest()
+                check(resetManagedStdioBrokerForTest(timeoutMs: 2000).ok)
+                setServicePluginWebhookSubscribersProvider(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                var user = GatewayUserSettings()
+                let root = JsonObject()
+                let agents = JsonObject()
+                let defaults = JsonObject()
+                defaults.put("workspace", JsonString(home.join("workspace").toString()))
+                agents.put("defaults", defaults)
+                root.put("agents", agents)
+                root.put("gateway", user.toJsonValue())
+                File.writeTo(home.join("metis.json"), root.toJsonString().toArray())
+                MetisConfigManager.invalidate(); CliSettingManager.invalidate()
+                let subscriptions = home.join("service-plugin").join("gitcode")
+                Directory.create(subscriptions, recursive: true)
+                let expectedPeer = "channel-start中文😀"
+                let subscriptionPath = subscriptions.join("subscriptions.jsonl").toString()
+                let writerStore = GitCodeSubscriptionStore(subscriptionPath)
+                let created = writerStore.createOrUpdate(GitCodeSubscriptionTarget("telegram", "default", expectedPeer),
+                    scope: GitCodeSubscriptionScope(rawEvents: false, generatedReplies: true))
+                check(created.ok && created.status == "created")
+                let freshLocalStore = GitCodeSubscriptionStore(subscriptionPath)
+                let loaded = freshLocalStore.load()
+                check(loaded.ok && loaded.status == "ok" && loaded.diagnostic.isEmpty())
+                let persisted = freshLocalStore.listActive()
+                check(persisted.size == 1 && persisted[0].active &&
+                    persisted[0].target.channel == "telegram" && persisted[0].target.accountId == "default" &&
+                    persisted[0].target.peerId == expectedPeer && persisted[0].target.threadId.isEmpty() &&
+                    !persisted[0].scope.rawEvents && persisted[0].scope.generatedReplies)
+                let event = ServicePluginAcceptedGitCodeEvent(eventId: "channel-start-order", jobId: "webhook-channel-start-order",
+                    repo: "cangjie/compiler", kind: "issue", number: "1", url: "https://example.invalid/issue/1")
+                let adapter = GatewayServiceStartupFakeAdapter("telegram", onStart: Some({ =>
+                    let targets = resolveGitCodeWebhookSubscribers(event)
+                    let ready = targets.size == 1 && targets[0].channel == "telegram" && targets[0].peerId == expectedPeer
+                    synchronized(sampleLock) { samples.add(ready) }
+                }))
+                let service = GatewayService(GatewayRouter(HashMap<String, ChannelPolicyConfig>()))
+                services.add(service)
+                service.registerAdapter(adapter, channelId: "telegram", accountId: "default")
+                let observationDeadline = MonoTime.now() + Duration.second * 5
+                service.start()
+                check(MonoTime.now() < observationDeadline)
+                check(adapter.startCount == 1 && synchronized(sampleLock) { samples.size == 1 && samples[0] })
+                check(service.stop(deadline: observationDeadline).ok)
+                check(adapter.stopCount == 1)
+                let settled = managedStdioBroker().snapshot()
+                check(!settled.running && settled.ownerCount == 0 && settled.readerCount == 0 && settled.dispatcherCount == 0)
+                formal = true
+            } catch (error: Exception) { bodyError = Some(error) } finally {
+                let cleanupDeadline = MonoTime.now() + Duration.second * 3
+                for (service in services) { attempt({ =>
+                    if (!service.stop(deadline: cleanupDeadline).ok) { throw Exception("startup_channel_cleanup_pending") }
+                }) }
+                attempt({ => resetServicePluginHostForTest() })
+                attempt({ =>
+                    let remaining = (cleanupDeadline - MonoTime.now()).toMilliseconds()
+                    if (remaining <= 0 || !resetManagedStdioBrokerForTest(timeoutMs: remaining).ok) { throw Exception("startup_channel_broker_pending") }
+                })
+                attempt({ => setServicePluginWebhookSubscribersProvider(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>) })
+                attempt({ => setServicePluginEventDelivery(None<(ServicePluginDeliveryTarget, String) -> ServicePluginEventDeliveryResult>) })
+                attempt({ => setServicePluginGeneratedReplyHandler(None<(ServicePluginPendingJob, ServicePluginAcceptedGitCodeEvent) -> ServicePluginGeneratedReplyResult>) })
+                attempt({ => setServicePluginWebhookGeneratedReplyHandler(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>) })
+                attempt({ => setGitCodeSubscriptionStore(None<GitCodeSubscriptionStore>) })
+                attempt({ => match (oldHome) { case Some(value) => setVariable("METIS_HOME", value) case None => removeVariable("METIS_HOME") } })
+                attempt({ => CliConfig.invalidatePathCache(); MetisConfigManager.invalidate(); CliSettingManager.invalidate() })
+                attempt({ => gatewayLoggingResetForTest() })
+                attempt({ => Config.logFile = oldLog })
+                if (MonoTime.now() > cleanupDeadline) { errors.add(Exception("startup_channel_cleanup_deadline")) }
+                if (formal && errors.isEmpty()) { attempt({ => remove(home, recursive: true) }) }
+                else { let savedFormal = formal; attempt({ => println("STARTUP-DISPATCH retained=${home.fileName};formal=${savedFormal}") }) }
+            }
+            match (bodyError) { case Some(error) => throw error case None => () }
+            if (!errors.isEmpty()) { throw errors[0] }
+        }
+    }
     @TestCase
     public func s3jU1FixedHomeRestoresStateAndRemovesOwnedDirectory(): Unit {
         let originalHome = getVariable("METIS_HOME")
