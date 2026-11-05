@@ -12,12 +12,12 @@ import magic.config.Config
 import magic.jsonable.*
 import metis.gateway.logging.gatewayLoggingResetForTest
 import metis.process.{managedRecoveryDirectorySafe, managedRecoveryReadText, managedRecoveryParseFields, managedRecoverySafeKey, observeProcessBirthIdentity, ManagedStdioBrokerClient, ProcessInstanceIdentity, currentProcessInstanceIdentity, managedStdioBroker, managedStdioResolveBrokerScriptPath, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, resetManagedStdioBrokerForTest, shutdownManagedStdioBroker, signalProcessInstance}
-import metis.utils.{InfoUtils, ShellTimeoutException, debugSetShellBrokerProviderForTest}
+import metis.utils.{InfoUtils, ShellUtils, ShellTimeoutException, debugSetShellBrokerProviderForTest}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.core.Duration
 import std.env.{getProcessId, getVariable, removeVariable, setVariable}
-import std.fs.{Directory, File, FileInfo, OpenMode, Path, SymbolicLink, canonicalize, exists, remove}
+import std.fs.{Directory, File, FileInfo, OpenMode, Path, SymbolicLink, canonicalize, exists, remove, rename}
 import std.net.*
 import std.process.{ProcessRedirect, SubProcess, executeWithOutput, launch}
 import std.sync.{AtomicBool, AtomicInt64}
@@ -4070,6 +4070,17 @@ public class GatewayServeLockLogicTest {
                 @Expect(brokerReady.pid > 1, true)
                 if (!brokerReady.ok || brokerReady.status != "ready" ||
                     brokerReady.generation <= 0 || brokerReady.pid <= 1) { return }
+                let fixtureReady = ShellUtils.execute(["lsof"],
+                    timeout: Some(Duration.second * 3), withWrap: false, logFailures: false)
+                @Expect(fixtureReady[0], 1)
+                let fixtureMarker = try { String.fromUtf8(File.readFrom(marker)) }
+                catch (_: Exception) { "invalid_fixture_marker" }
+                @Expect(fixtureMarker, "called")
+                if (fixtureReady[0] != 1 || fixtureMarker != "called") {
+                    throw Exception("listener_fixture_not_ready")
+                }
+                remove(marker)
+                @Expect(exists(marker), false)
                 let before = managedStdioBroker().snapshot()
                 @Expect(before.running, true)
                 @Expect(before.responsive, true)
@@ -5150,6 +5161,14 @@ public class GatewayServeLockLogicTest {
             let faultMarker = home.join("listener-timeout.enabled")
             let lsofCalled = home.join("listener-timeout.called")
             let bin = home.join("bin")
+            let faultScript = home.join("listener-timeout-lsof.sh")
+            let systemLsof = Path("/usr/sbin/lsof")
+            let routeListenerProbe = { target: Path =>
+                let pending = bin.join("lsof.pending")
+                if (exists(pending)) { remove(pending) }
+                SymbolicLink.create(pending, to: target)
+                rename(pending, to: bin.join("lsof"), overwrite: true)
+            }
             let launchWrapper = home.join("gateway-run-with-stderr.sh")
             var dependencies = None<GatewayS5DependencyProcess>
             var gatewayProcess = None<SubProcess>
@@ -5179,8 +5198,9 @@ public class GatewayServeLockLogicTest {
                 setVariable("METIS_HOME", home.toString())
                 setVariable("METIS_CJPM_ROOT", project.toString())
                 let inheritedPath = match (oldPath) { case Some(value) => value case None => "/usr/bin:/bin" }
+                setVariable("PATH", "${bin.toString()}:${inheritedPath}")
                 File.writeTo(
-                    bin.join("lsof"),
+                    faultScript,
                     ("#!/bin/sh\nif [ -f '${faultMarker.toString()}' ]; then\n" +
                         "  printf called > '${lsofCalled.toString()}'\n  sleep 1\n  exit 1\nfi\n" +
                         "printf started > '${home.join("listener-probe.started").toString()}' 2>/dev/null || :\n" +
@@ -5188,7 +5208,22 @@ public class GatewayServeLockLogicTest {
                         "printf '%s\\n' \"$listener_rc\" > '${home.join("listener-probe.exit").toString()}' 2>/dev/null || :\n" +
                         "exit \"$listener_rc\"\n").toArray()
                 )
-                @Expect(executeWithOutput("/bin/chmod", ["700", bin.join("lsof").toString()])[0], 0)
+                @Expect(executeWithOutput("/bin/chmod", ["700", faultScript.toString()])[0], 0)
+                // Prepare the fault executable before its original short measured probe.
+                let fixtureReady = ShellUtils.execute([faultScript.toString(), "-v"],
+                    timeout: Some(Duration.second * 3), withWrap: false)
+                @Expect(fixtureReady[0], 0)
+                let fixtureStarted = try {
+                    String.fromUtf8(File.readFrom(home.join("listener-probe.started")))
+                } catch (_: Exception) { "invalid_fixture_marker" }
+                let fixtureExit = try {
+                    String.fromUtf8(File.readFrom(home.join("listener-probe.exit"))).trimAscii()
+                } catch (_: Exception) { "invalid_fixture_marker" }
+                @Expect(fixtureStarted, "started")
+                @Expect(fixtureExit, "0")
+                @Expect(exists(lsofCalled), false)
+                // Ordinary probes must execute the real tool without a fault-shim shell.
+                routeListenerProbe(systemLsof)
                 File.writeTo(
                     launchWrapper,
                     ("#!/bin/sh\nexport DYLD_LIBRARY_PATH=\"$METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH\"\n" +
@@ -5202,7 +5237,6 @@ public class GatewayServeLockLogicTest {
                         "exec \"$1\" gateway run >\"$3\" 2>\"$2\"\n").toArray()
                 )
                 @Expect(executeWithOutput("/bin/chmod", ["700", launchWrapper.toString()])[0], 0)
-                setVariable("PATH", "${bin.toString()}:${inheritedPath}")
                 let taskDyld = getVariable("DYLD_LIBRARY_PATH").getOrDefault { "" }.trimAscii()
                 @Expect(taskDyld.isEmpty(), false)
                 if (taskDyld.isEmpty()) { return }
@@ -5239,6 +5273,7 @@ public class GatewayServeLockLogicTest {
                     let brokerDiagnosticPath = home.join("gateway-${generation}.broker-diagnostics")
                     Directory.create(brokerDiagnosticPath, recursive: true)
                     setVariable("METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER", brokerDiagnosticPath.toString())
+                    @Expect(canonicalize(bin.join("lsof")), canonicalize(systemLsof))
                     let launched = launch(
                         launchWrapper.toString(),
                         [metisBinary.toString(), stderrPath.toString(), stdoutPath.toString()],
@@ -5367,26 +5402,32 @@ public class GatewayServeLockLogicTest {
                             @Expect(gatewayServeStopPidAlive(stableGcmPid), true)
                         }
                         let beforeFaultHeartbeat = gatewayHeartbeatRuntimeInt(runtimePath, "updatedAtMs")
-                        File.writeTo(faultMarker, "enabled".toArray())
-                        @Expect(gatewayServeStopWaitUntil(15000, { =>
-                            gatewayHeartbeatRuntimeInt(runtimePath, "updatedAtMs") > beforeFaultHeartbeat
-                        }), true)
-                        liveOwner.refresh(readyzUrl)
-                        @Expect(exists(lsofCalled), false)
-                        @Expect(liveOwner.httpStatus, 200)
-                        @Expect(liveOwner.running, true)
-                        @Expect(gatewayServeStopPidAlive(stableGatewayPid), true)
-                        @Expect(gatewayServeStopPidAlive(stableGcmPid), true)
-                        let timeout = gatewayFindVerifiedListenerPidsOnPortDetailed(port: gatewayPort, timeoutMs: 30)
-                        @Expect(timeout.conclusive, false)
-                        @Expect(timeout.status, "listener_discovery_timeout")
-                        @Expect(exists(lsofCalled), true)
-                        liveOwner.refresh(readyzUrl)
-                        @Expect(liveOwner.httpStatus, 200)
-                        @Expect(liveOwner.running, true)
-                        @Expect(gatewayServeStopPidAlive(stableGatewayPid), true)
-                        @Expect(gatewayServeStopPidAlive(stableGcmPid), true)
-                        try { remove(faultMarker) } catch (_: Exception) { () }
+                        routeListenerProbe(faultScript)
+                        @Expect(canonicalize(bin.join("lsof")), canonicalize(faultScript))
+                        try {
+                            File.writeTo(faultMarker, "enabled".toArray())
+                            @Expect(gatewayServeStopWaitUntil(15000, { =>
+                                gatewayHeartbeatRuntimeInt(runtimePath, "updatedAtMs") > beforeFaultHeartbeat
+                            }), true)
+                            liveOwner.refresh(readyzUrl)
+                            @Expect(exists(lsofCalled), false)
+                            @Expect(liveOwner.httpStatus, 200)
+                            @Expect(liveOwner.running, true)
+                            @Expect(gatewayServeStopPidAlive(stableGatewayPid), true)
+                            @Expect(gatewayServeStopPidAlive(stableGcmPid), true)
+                            let timeout = gatewayFindVerifiedListenerPidsOnPortDetailed(port: gatewayPort, timeoutMs: 30)
+                            @Expect(timeout.conclusive, false)
+                            @Expect(timeout.status, "listener_discovery_timeout")
+                            @Expect(exists(lsofCalled), true)
+                            liveOwner.refresh(readyzUrl)
+                            @Expect(liveOwner.httpStatus, 200)
+                            @Expect(liveOwner.running, true)
+                            @Expect(gatewayServeStopPidAlive(stableGatewayPid), true)
+                            @Expect(gatewayServeStopPidAlive(stableGcmPid), true)
+                        } finally {
+                            try { remove(faultMarker) } catch (_: Exception) { () }
+                            routeListenerProbe(systemLsof)
+                        }
                     }
 
                     let preStopStderr = try {
@@ -5401,6 +5442,7 @@ public class GatewayServeLockLogicTest {
                     @Expect(stopIdentity.isSome(), true)
                     if (!stopIdentity.isSome()) { return }
                     @Expect(stopIdentity.getOrThrow().matches(currentIdentity), true)
+                    @Expect(canonicalize(bin.join("lsof")), canonicalize(systemLsof))
                     @Expect(gatewayExecuteStopServe(), 0)
                     let completionPath = home.join("gateway-serve.stop-complete")
                     @Expect(exists(completionPath), true)
@@ -5485,6 +5527,12 @@ public class GatewayServeLockLogicTest {
                 }
                 allTerminal = true
             } finally {
+                // Restore independently so a routing failure cannot skip owned cleanup.
+                let listenerRouteRestored = try {
+                    if (exists(bin)) { routeListenerProbe(systemLsof) }
+                    true
+                } catch (_: Exception) { false }
+                @Expect(listenerRouteRestored, true)
                 if (gatewayIdentity.isSome()) {
                     try { gatewayServeStopReapOwnedGateway(gatewayIdentity, metisBinary, home) } catch (_: Exception) { () }
                 }
