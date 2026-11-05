@@ -11,7 +11,8 @@ import std.unittest.testmacro.*
 
 @When[os == "macOS"]
 foreign {
-    func setrlimit(resource: Int32, limit: CPointer<UInt64>): Int32
+    func fopen(path: CString, mode: CString): CPointer<Unit>
+    func fclose(stream: CPointer<Unit>): Int32
 }
 
 @Test
