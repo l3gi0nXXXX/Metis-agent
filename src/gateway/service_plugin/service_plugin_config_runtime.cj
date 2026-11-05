@@ -94,7 +94,7 @@ public func servicePluginConfiguredStatusForUser(user: GatewayUserSettings, plug
     ConfiguredServicePluginStatus(wanted, false, "missing", errorKind: "plugin_missing", diagnostic: "service plugin is not configured")
 }
 
-public func registerConfiguredServicePlugins(user: GatewayUserSettings): Unit {
+public func registerConfiguredServicePlugins(user: GatewayUserSettings, autostart!: Bool = true): Unit {
     for (plugin in user.servicePlugins) {
         let pluginId = plugin.pluginId.trimAscii()
         if (pluginId.isEmpty()) {
@@ -144,7 +144,7 @@ public func registerConfiguredServicePlugins(user: GatewayUserSettings): Unit {
             errorKind: if (result.ok) { "" } else { result.status }
         )
     }
-    startAutostartServicePlugins(user)
+    if (autostart) { startAutostartServicePlugins(user) }
 }
 
 public func startAutostartServicePlugins(user: GatewayUserSettings): Unit {

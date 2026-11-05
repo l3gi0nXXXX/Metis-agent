@@ -489,10 +489,8 @@ public class GatewayService {
             }
         }
         let startMs = this.startNowMs()
-        let startupSummary = this.channelManager.startChannels()
         let user = CliSettingManager.readGatewaySettings()
         this.loadGitCodeReviewPromptRuntimeFromConfig()
-        registerConfiguredServicePlugins(user)
         setGitCodeSubscriptionStore(Some(loadGitCodeSubscriptionStore(CliConfig.dotDir.join("service-plugin").join("gitcode").join("subscriptions.jsonl").toString())))
         setServicePluginEventDelivery(Some({ target: ServicePluginDeliveryTarget, text: String =>
             try {
@@ -522,6 +520,8 @@ public class GatewayService {
         setServicePluginWebhookSubscribersProvider(Some({ event: ServicePluginAcceptedGitCodeEvent =>
             gitCodeSubscriptionStoreSnapshotForDispatcher(event)
         }))
+        let startupSummary = this.channelManager.startChannels()
+        registerConfiguredServicePlugins(user)
         let _ = gatewayOpenClawCompatHostStart(user)
         let _ = gatewayOpenClawPluginSidecarStart(user)
         let startupStatus = try {

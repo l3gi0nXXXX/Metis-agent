@@ -98,7 +98,7 @@ public func buildGatewayServiceFromUserSettings(user: GatewayUserSettings): (Gat
     gatewayInstallOpenClawCompatHostLifecycleHooks()
     ensureInstalledGatewayPluginsRegistered()
     gatewayConfigFactoryTimingLog("plugins-registered", startMs)
-    registerConfiguredServicePlugins(user)
+    registerConfiguredServicePlugins(user, autostart: false)
     gatewayConfigFactoryTimingLog("service-plugins-registered", startMs)
     gatewayPrimeConfiguredChannelBindings(user)
     gatewayConfigFactoryTimingLog("bindings-primed", startMs)

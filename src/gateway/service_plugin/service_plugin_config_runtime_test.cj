@@ -7,7 +7,10 @@ import metis.gateway.logging.gatewayLoggingResetForTest
 import std.collection.ArrayList
 import std.env.{getVariable, removeVariable, setVariable}
 import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists, remove}
-import std.time.DateTime
+import std.time.{DateTime, MonoTime}
+import std.env.getProcessId
+import metis.process.{managedStdioBroker, resetManagedStdioBrokerForTest}
+import std.core.Duration
 import std.unittest.testmacro.*
 import stdx.encoding.json.JsonString
 
@@ -112,6 +115,92 @@ private func withServicePluginConfigRuntimeTestHome<T>(label: String, block: () 
 
 @Test
 public class ServicePluginConfigRuntimeTest {
+
+    @TestCase
+    public func registerConfiguredServicePluginsCanDeferRealAutostart(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = Directory.createTemp("/private/tmp")
+            let oldHome = getVariable("METIS_HOME")
+            let oldLog = Config.logFile
+            let errors = ArrayList<Exception>()
+            let attempt = { action: () -> Unit => try { action() } catch (error: Exception) { errors.add(error) } }
+            let check = { value: Bool =>
+                @Expect(value, true)
+                if (!value) { throw Exception("startup_deferred_contract_failed") }
+            }
+            var bodyError = None<Exception>
+            var formal = false
+            try {
+                File.writeTo(home.join("startup-dispatch.owner"),
+                    "metis-startup-dispatch-v1\ntestPid:${getProcessId()}\nname:config-deferred\n".toArray())
+                setVariable("METIS_HOME", home.toString())
+                servicePluginConfigRuntimeResetCaches()
+                resetServicePluginHostForTest()
+                check(resetManagedStdioBrokerForTest(timeoutMs: 2000).ok)
+                let launched = home.join("launched")
+                let argument = home.join("argument")
+                let expectedArgument = "参数中文😀"
+                let script = "printf 'launch\\n' >> '${launched.toString()}'; printf '%s' \"$1\" > '${argument.toString()}'; " +
+                    "printf '%s\\n' '{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"gitcode-monitor\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ready\"}}'; " +
+                    "while IFS= read -r request; do exit 0; done"
+                let manifest = home.join("plugin.json")
+                File.writeTo(manifest, servicePluginConfigRuntimeStdioManifest("/bin/sh", ["-c", script, "startup", expectedArgument]).toArray())
+                var plugin = GatewayServicePluginUserSettings()
+                plugin.pluginId = "gitcode-monitor"
+                plugin.manifestPath = manifest.toString()
+                plugin.autostart = true
+                plugin.startupTimeoutMs = 1000
+                var user = GatewayUserSettings()
+                user.servicePlugins = [plugin]
+                let baseline = managedStdioBroker().snapshot()
+                registerConfiguredServicePlugins(user, autostart: false)
+                let deferred = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                let unlaunched = managedStdioBroker().snapshot()
+                check(deferred.status == "registered" && deferred.pid == 0 &&
+                    deferred.capabilityIds.contains("gitcode.monitor.status") && !exists(launched))
+                check(unlaunched.ownerCount == 0 && unlaunched.brokerPid == 0 && unlaunched.generation == baseline.generation)
+                let observationDeadline = MonoTime.now() + Duration.second * 5
+                registerConfiguredServicePlugins(user)
+                let active = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                check(active.status == "running" && active.pid > 1 && MonoTime.now() < observationDeadline)
+                registerConfiguredServicePlugins(user)
+                let markers = try { String.fromUtf8(File.readFrom(launched)) }
+                    catch (_: Exception) { throw Exception("startup_marker_invalid_encoding") }
+                let observedArgument = try { String.fromUtf8(File.readFrom(argument)) }
+                    catch (_: Exception) { throw Exception("startup_argument_invalid_encoding") }
+                check(markers == "launch\n" && observedArgument == expectedArgument)
+                let remaining = (observationDeadline - MonoTime.now()).toMilliseconds()
+                check(remaining > 0)
+                check(stopServicePlugin("gitcode-monitor", reason: "startup-deferred", timeoutMillis: min(2000, remaining)).ok)
+                let resourceDeadline = MonoTime.now() + Duration.second * 2
+                check(servicePluginCleanupPendingCountForTest() == 0)
+                let resourceRemaining = (resourceDeadline - MonoTime.now()).toMilliseconds()
+                check(resourceRemaining > 0)
+                check(resetManagedStdioBrokerForTest(timeoutMs: resourceRemaining).ok)
+                let settled = managedStdioBroker().snapshot()
+                check(!settled.running && settled.ownerCount == 0 && settled.readerCount == 0 && settled.dispatcherCount == 0)
+                formal = true
+            } catch (error: Exception) { bodyError = Some(error) } finally {
+                let cleanupDeadline = MonoTime.now() + Duration.second * 3
+                attempt({ => resetServicePluginHostForTest() })
+                attempt({ =>
+                    let remaining = (cleanupDeadline - MonoTime.now()).toMilliseconds()
+                    if (remaining <= 0 || !resetManagedStdioBrokerForTest(timeoutMs: remaining).ok) {
+                        throw Exception("startup_deferred_cleanup_pending")
+                    }
+                })
+                attempt({ => servicePluginConfigRuntimeRestoreEnv("METIS_HOME", oldHome) })
+                attempt({ => servicePluginConfigRuntimeResetCaches() })
+                attempt({ => gatewayLoggingResetForTest() })
+                attempt({ => Config.logFile = oldLog })
+                if (MonoTime.now() > cleanupDeadline) { errors.add(Exception("startup_deferred_cleanup_deadline")) }
+                if (formal && errors.isEmpty()) { attempt({ => remove(home, recursive: true) }) }
+                else { let savedFormal = formal; attempt({ => println("STARTUP-DISPATCH retained=${home.fileName};formal=${savedFormal}") }) }
+            }
+            match (bodyError) { case Some(error) => throw error case None => () }
+            if (!errors.isEmpty()) { throw errors[0] }
+        }
+    }
     @TestCase
     public func registerConfiguredServicePluginsLoadsManifestAndRegistersCapabilities(): Unit {
         withServicePluginConfigRuntimeTestHome("valid", { =>
