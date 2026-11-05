@@ -33,38 +33,47 @@ foreign {
         size: CPointer<UIntNative>, replacement: CPointer<Unit>, replacementSize: UIntNative): Int32
 }
 
+private func fdE2EKernelArgumentsError(status: String, stage: String): Exception {
+    try { println("FD_E2E_KERNEL_ARGUMENTS stage=${stage}") } catch (_: Exception) { () }
+    Exception(status)
+}
+
 private func fdE2EParseKernelEnvironment(bytes: Array<Byte>, used: Int64): HashMap<String, String> {
-    if (used < 5 || used > bytes.size || bytes.size > 1048576) { throw Exception("fixture_process_arguments_invalid") }
+    if (used < 5 || used > bytes.size || bytes.size > 1048576) {
+        throw fdE2EKernelArgumentsError("fixture_process_arguments_invalid", "header")
+    }
     let argc = Int64(bytes[0]) | (Int64(bytes[1]) << 8) | (Int64(bytes[2]) << 16) | (Int64(bytes[3]) << 24)
-    if (argc <= 0 || argc > 4096) { throw Exception("fixture_process_arguments_invalid") }
+    if (argc <= 0 || argc > 4096) { throw fdE2EKernelArgumentsError("fixture_process_arguments_invalid", "argc") }
     var cursor: Int64 = 4
     while (cursor < used && bytes[cursor] != 0) { cursor += 1 }
-    if (cursor == used) { throw Exception("fixture_process_arguments_invalid") }
+    if (cursor == used) { throw fdE2EKernelArgumentsError("fixture_process_arguments_invalid", "exec_path") }
     while (cursor < used && bytes[cursor] == 0) { cursor += 1 }
     for (_ in 0..argc) {
         let start = cursor
         while (cursor < used && bytes[cursor] != 0) { cursor += 1 }
-        if (cursor == used) { throw Exception("fixture_process_arguments_invalid") }
+        if (cursor == used) { throw fdE2EKernelArgumentsError("fixture_process_arguments_invalid", "argv") }
         try { let _ = String.fromUtf8(bytes[start..cursor]) }
-        catch (_: Exception) { throw Exception("fixture_process_encoding_invalid") }
+        catch (_: Exception) { throw fdE2EKernelArgumentsError("fixture_process_encoding_invalid", "argv_encoding") }
         cursor += 1
     }
+    // Darwin may omit the environment and return exactly the complete argv region.
+    if (cursor == used) { throw fdE2EKernelArgumentsError("fixture_process_arguments_unavailable", "env_absent") }
     let result = HashMap<String, String>()
     while (cursor < used && bytes[cursor] != 0) {
         let start = cursor
         while (cursor < used && bytes[cursor] != 0) { cursor += 1 }
-        if (cursor == used) { throw Exception("fixture_process_arguments_invalid") }
+        if (cursor == used) { throw fdE2EKernelArgumentsError("fixture_process_arguments_invalid", "env_entry") }
         let entry = try { String.fromUtf8(bytes[start..cursor]) }
-            catch (_: Exception) { throw Exception("fixture_process_encoding_invalid") }
+            catch (_: Exception) { throw fdE2EKernelArgumentsError("fixture_process_encoding_invalid", "env_encoding") }
         for (key in ["METIS_HOME", "METIS_FD_E2E_CHILD_NONCE", "METIS_FD_E2E_CHILD_MODE"]) {
             if (entry.startsWith(key + "=")) {
-                if (result.contains(key)) { throw Exception("fixture_process_arguments_invalid") }
+                if (result.contains(key)) { throw fdE2EKernelArgumentsError("fixture_process_arguments_invalid", "env_duplicate") }
                 result[key] = entry.removePrefix(key + "=")
             }
         }
         cursor += 1
     }
-    if (cursor >= used) { throw Exception("fixture_process_arguments_invalid") }
+    if (cursor >= used) { throw fdE2EKernelArgumentsError("fixture_process_arguments_invalid", "env_tail") }
     result
 }
 
@@ -1460,6 +1469,9 @@ public class GatewayFdExhaustionE2ETest {
         for (_ in 0..512) { longNonce += "中文😀" }
         let prefix = ArrayList<Byte>([1, 0, 0, 0])
         prefix.add(all: "/fixture\u{0}\u{0}METIS_HOME=argument-decoy\u{0}".toArray())
+        let argvOnlyUnavailable = try { let _ = fdE2EParseKernelEnvironment(prefix.toArray(), prefix.size); false }
+            catch (error: Exception) { error.message == "fixture_process_arguments_unavailable" }
+        @Expect(argvOnlyUnavailable, true)
         let valid = ArrayList<Byte>(prefix.toArray())
         valid.add(all: ("METIS_HOME=/private/tmp/中文😀\u{0}" +
             "METIS_FD_E2E_CHILD_NONCE=${longNonce}\u{0}METIS_FD_E2E_CHILD_MODE=short\u{0}" +
@@ -1476,6 +1488,9 @@ public class GatewayFdExhaustionE2ETest {
         binary.add(all: "METIS_HOME=".toArray())
         binary.add(all: [0xff, 0, 0])
         let validBytes = valid.toArray()
+        let truncatedInvalid = try { let _ = fdE2EParseKernelEnvironment(validBytes, validBytes.size - 1); false }
+            catch (error: Exception) { error.message == "fixture_process_arguments_invalid" }
+        @Expect(truncatedInvalid, true)
         let malformed: Array<Array<Byte>> = [[], [1, 0, 0, 0], [0, 0, 0, 0, 0],
             [1, 16, 0, 0, 0], duplicate.toArray(), binary.toArray(), validBytes[..validBytes.size - 1]]
         for (bytes in malformed) {
