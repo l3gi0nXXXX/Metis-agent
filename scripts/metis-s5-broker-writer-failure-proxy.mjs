@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 
-import { spawn } from 'node:child_process';
+import { PassThrough } from 'node:stream';
 import { closeSync, existsSync, fstatSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { TextDecoder } from 'node:util';
+import { pathToFileURL } from 'node:url';
 
 const brokerScript = process.argv[2] ?? '';
+if (process.argv[3] === '--attached') {
+  const { runAttachedBroker } = await import(pathToFileURL(brokerScript).href);
+  runAttachedBroker(process.argv[4], process.argv.slice(5));
+} else {
 const readyPath = process.env.METIS_S5_BROKER_PROXY_READY ?? '';
 const failPath = process.env.METIS_S5_BROKER_PROXY_FAIL ?? '';
 const closedPath = process.env.METIS_S5_BROKER_PROXY_WRITER_CLOSED ?? '';
@@ -65,10 +70,15 @@ const stdinAliases = stdinFifo ? readdirSync('/dev/fd').flatMap((name) => {
   catch (error) { if (error?.code === 'EBADF') return []; throw error; }
 }) : [0];
 
-const broker = spawn(process.execPath, [brokerScript], {
-  env: process.env,
-  stdio: ['pipe', 'pipe', 'ignore'],
-});
+// The Gateway owns this exact process. A second fork would violate its bound
+// parent identity and would publish another PID under the same recovery key.
+const brokerPid = process.pid;
+const brokerInput = new PassThrough();
+const brokerOutput = new PassThrough();
+let realBroker;
+const declaredParentPid = process.env.METIS_PROCESS_RECOVERY_OWNER_PID;
+const expectedParentPid = declaredParentPid === undefined ? process.ppid : Number(declaredParentPid);
+const originalParentPresent = () => Number.isSafeInteger(expectedParentPid) && expectedParentPid > 1 && process.ppid === expectedParentPid;
 let writerClosed = false;
 let settled = false;
 let inputPending = Buffer.alloc(0);
@@ -102,7 +112,7 @@ const fatalUtf8Decoder = new TextDecoder('utf-8', { fatal: true });
 function publishReady() {
   writeAtomic(readyPath, JSON.stringify({
     wrapperPid: process.pid,
-    brokerPid: broker.pid ?? 0,
+    brokerPid: brokerPid,
     parentPid: process.ppid,
     generation: brokerGeneration,
     helloBrokerPid: brokerHelloPid,
@@ -296,7 +306,7 @@ function forwardInputLine(lineWithNewline) {
     ack.ownerId === boundOwnerId &&
     !completionDropped
   ) {
-    if (brokerGeneration !== expectedGeneration || brokerHelloPid !== (broker.pid ?? 0)) {
+    if (brokerGeneration !== expectedGeneration || brokerHelloPid !== (brokerPid)) {
       invalidContract();
     }
     completionDropped = true;
@@ -311,8 +321,8 @@ function forwardInputLine(lineWithNewline) {
     });
     return;
   }
-  if (!writerClosed && !broker.stdin.destroyed) {
-    broker.stdin.write(lineWithNewline);
+  if (!writerClosed && !brokerInput.destroyed) {
+    brokerInput.write(lineWithNewline);
     if (ownerStart !== null) {
       rememberOwnerStart(frame);
       publishReady();
@@ -333,7 +343,7 @@ function observeBrokerLine(lineWithNewline) {
         (dropMode && generation !== expectedGeneration) ||
         !Number.isSafeInteger(pid) ||
         pid <= 0 ||
-        pid !== (broker.pid ?? 0)
+        pid !== (brokerPid)
       ) {
         invalidContract();
       }
@@ -403,14 +413,14 @@ function drainLines(pending, consume) {
   return current;
 }
 
-broker.stdin.on('error', () => {
+brokerInput.on('error', () => {
   // Closing the proxy writer is the injected failure contract.
 });
 process.stdout.on('error', () => {
   // The production owner may close its reader while the broker settles.
 });
 
-broker.stdout.on('data', (chunk) => {
+brokerOutput.on('data', (chunk) => {
   brokerOutputPending = Buffer.concat([brokerOutputPending, chunk]);
   brokerOutputPending = drainLines(brokerOutputPending, observeBrokerLine);
 });
@@ -419,9 +429,9 @@ process.stdin.on('data', (chunk) => {
   inputPending = drainLines(inputPending, forwardInputLine);
 });
 process.stdin.on('end', () => {
-  if (inputPending.length > 0 && !writerClosed && !broker.stdin.destroyed) broker.stdin.write(inputPending);
+  if (inputPending.length > 0 && !writerClosed && !brokerInput.destroyed) brokerInput.write(inputPending);
   inputPending = Buffer.alloc(0);
-  if (!broker.stdin.destroyed) broker.stdin.end();
+  if (!brokerInput.destroyed) brokerInput.end();
 });
 process.stdin.on('error', () => {});
 
@@ -443,16 +453,16 @@ const watcher = setInterval(() => {
           if (error?.code !== 'EBADF') throw error;
         }
       }
-      broker.stdin.destroy();
+      brokerInput.destroy(new Error('broker_proxy_writer_closed'));
       writeAtomic(closedPath, 'writer_closed\n');
     }));
     process.stdin.destroy();
   }
-  if (writerMode && existsSync(cleanupPath) && broker.exitCode === null && broker.signalCode === null) {
-    broker.kill('SIGKILL');
+  if (writerMode && existsSync(cleanupPath) && !brokerExitObserved) {
+    realBroker?.closeBroker();
   }
   if (holdMode && holdEntered && !holdReleased &&
-      (existsSync(holdReleasePath) || (writerMode && existsSync(cleanupPath)))) {
+      (existsSync(holdReleasePath) || (writerMode && existsSync(cleanupPath)) || !originalParentPresent())) {
     holdReleased = true;
     writeAtomic(holdReleasedPath, 'hold_released\n');
     clearInterval(watcher);
@@ -461,15 +471,15 @@ const watcher = setInterval(() => {
   }
 }, 5);
 
-broker.on('exit', (code, signal) => {
+function brokerSettled(code) {
   if (brokerExitObserved) return;
   brokerExitObserved = true;
   if (brokerOutputPending.length > 0) enqueueOutput(brokerOutputPending);
   brokerOutputPending = Buffer.alloc(0);
   process.stdin.removeAllListeners();
   process.stdin.destroy();
-  proxyExitCode = Number.isInteger(code) ? code : signal ? 1 : 0;
-  if (holdMode) {
+  proxyExitCode = Number.isInteger(code) ? code : 1;
+  if (holdMode && writerClosed && originalParentPresent()) {
     holdEntered = true;
     writeAtomic(holdEnteredPath, 'hold_entered\n');
     return;
@@ -478,8 +488,9 @@ broker.on('exit', (code, signal) => {
   clearInterval(watcher);
   outputEndRequested = true;
   finishOutputIfReady();
-});
+}
 
-process.on('SIGTERM', () => {
-  if (broker.exitCode === null && broker.signalCode === null) broker.kill('SIGTERM');
-});
+const { runBroker } = await import(pathToFileURL(brokerScript).href);
+realBroker = runBroker({ input: brokerInput, output: brokerOutput, exit: brokerSettled });
+
+}
