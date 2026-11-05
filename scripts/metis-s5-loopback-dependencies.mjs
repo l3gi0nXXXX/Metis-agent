@@ -2,6 +2,7 @@
 
 import fs from "node:fs";
 import http from "node:http";
+import { performance } from "node:perf_hooks";
 
 const [
   readyPath,
@@ -23,6 +24,9 @@ if (!readyPath || !eventsPath) {
   let modelEntered = 0;
   let modelMaxActive = 0;
   const telegramGate = telegramGatePath ? JSON.parse(fs.readFileSync(telegramGatePath, "utf8")) : null;
+  if (telegramGate?.pollMode === "hold" && (typeof telegramGate.pollReleasePath !== "string" || !telegramGate.pollReleasePath)) {
+    throw new Error("invalid_fixture_poll_release");
+  }
   const telegramAccounts = new Map();
   const deliveryByIid = new Map();
   const appendEvent = (event) => {
@@ -56,9 +60,15 @@ if (!readyPath || !eventsPath) {
     const row = telegramAccounts.get(account) ?? {
       pollEntered: 0, pollActive: 0, confirmEntered: 0, confirmActive: 0,
       peerClosed: 0, completed: 0, lastConfirmOffset: 0, confirmFailed: 0,
+      pollPeerClosed: 0, pollCompleted: 0, maxPollElapsedMs: 0, pollExpectedReadTimeoutMs: 0,
     };
     telegramAccounts.set(account, row);
     const poll = Object.hasOwn(body, "timeout");
+    const enteredAt = performance.now();
+    if (poll && telegramGate.pollMode === "hold") {
+      if (!Number.isSafeInteger(body.timeout) || body.timeout < 0) throw new Error("invalid_fixture_poll_timeout");
+      row.pollExpectedReadTimeoutMs = (body.timeout + 5) * 1000;
+    }
     row[poll ? "pollEntered" : "confirmEntered"] += 1;
     row[poll ? "pollActive" : "confirmActive"] += 1;
     if (!poll) row.lastConfirmOffset = body.offset ?? 0;
@@ -66,12 +76,22 @@ if (!readyPath || !eventsPath) {
     response.once("close", () => {
       row[poll ? "pollActive" : "confirmActive"] -= 1;
       row[response.writableFinished ? "completed" : "peerClosed"] += 1;
+      if (poll) {
+        row[response.writableFinished ? "pollCompleted" : "pollPeerClosed"] += 1;
+        row.maxPollElapsedMs = Math.max(row.maxPollElapsedMs, Math.floor(performance.now() - enteredAt));
+      }
       appendEvent({ kind: response.writableFinished ? "telegram_request_completed" : "telegram_peer_closed", account, poll });
       writeTelegramMetrics();
     });
     writeTelegramMetrics();
     if (poll) {
-      await new Promise((resolve) => setTimeout(resolve, telegramGate.pollDelayMs ?? 1000));
+      if (telegramGate.pollMode === "hold") {
+        while (!response.destroyed && !fs.existsSync(telegramGate.pollReleasePath)) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, telegramGate.pollDelayMs ?? 1000));
+      }
     } else {
       while (telegramGate.confirmMode === "hold" && !response.destroyed && !fs.existsSync(telegramGate.releasePath)) {
         await new Promise((resolve) => setTimeout(resolve, 20));
