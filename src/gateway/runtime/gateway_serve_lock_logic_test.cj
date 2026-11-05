@@ -1890,11 +1890,11 @@ private class HrFormalGateway {
         }
     }
 
-    func awaitReady(process: SubProcess, ready: Path): Unit {
+    func awaitReady(process: SubProcess, ready: Path, additionalReady!: () -> Bool = { => true }): Unit {
         let proof = GatewayServeStopLiveOwnerProof()
         let accepted = gatewayServeStopWaitUntil(20000, { =>
             proof.refresh("http://127.0.0.1:${this.port}/readyz")
-            process.isAlive() && exists(ready) && proof.httpStatus == 200 && proof.running && proof.ownerCount == 1
+            process.isAlive() && exists(ready) && proof.httpStatus == 200 && proof.running && proof.ownerCount == 1 && additionalReady()
         })
         @Expect(accepted, true)
         if (!accepted) {
@@ -1935,7 +1935,15 @@ private class HrFormalGateway {
         @Expect(gatewayServeStopWaitUntil(5000, { => exists(ready) }), true)
         this.configure(["delegate", ready.toString(), registration.toString(), registered.toString(), this.home.join("old-delegate.stop").toString()])
         let process = this.launchGateway(nonzeroBroker: true)
-        this.awaitReady(process, ready)
+        this.awaitReady(process, ready, additionalReady: { =>
+            if (!exists(registered)) { return false }
+            try {
+                let lease = JsonValue.fromStr(hrFormalRead(gatewayS5FindLease(this.home))).asObject()
+                lease.get("state").getOrThrow().asString().getValue() == "running" &&
+                    lease.get("parentPid").getOrThrow().asInt().getValue() == process.pid &&
+                    lease.get("pid").getOrThrow().asInt().getValue() > 1
+            } catch (_: Exception) { false }
+        })
         @Expect(exists(registered), true)
         let oldLease = gatewayS5FindLease(this.home)
         @Expect(hrFormalRead(oldLease).contains("running"), true)
