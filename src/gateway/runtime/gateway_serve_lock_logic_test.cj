@@ -286,6 +286,33 @@ private func gatewayHeartbeatCaptureOwnedIdentityDetailed(
         attempts, unavailableCount, lockSeen)
 }
 
+private func gatewayHeartbeatPrintStartupCaptureDiagnostic(
+    home: Path, generation: Int64, captured: GatewayHeartbeatIdentityCaptureResult
+): Unit {
+    try {
+        let reason = try {
+            JsonValue.fromStr(String.fromUtf8(File.readFrom(home.join("gateway-runtime-state.json"))))
+                .asObject().get("reason").getOrThrow().asString().getValue()
+        } catch (_: Exception) { "" }
+        let startup = if (reason == "lock-not-acquired") { "lock_not_acquired" }
+            else if (reason.isEmpty()) { "runtime_unavailable" } else { "runtime_other" }
+        let started = exists(home.join("listener-probe.started"))
+        let exited = exists(home.join("listener-probe.exit"))
+        let code = try {
+            let value = Int64.parse(String.fromUtf8(File.readFrom(home.join("listener-probe.exit"))).trimAscii())
+            if (value >= 0 && value <= 255) { value } else { -1 }
+        } catch (_: Exception) { -1 }
+        let listener = if (!started) { "not_invoked" } else if (!exited) { "started_without_exit" }
+            else if (code < 0) { "invalid_exit" } else { "completed" }
+        File.writeTo(home.join("gateway-formal-retained.owner"),
+            "metis-gateway-formal-retained-v1\ntestPid:${getProcessId()}\nname:heartbeat-e2e\n".toArray())
+        println("HB-STARTUP generation=${generation} capture=${captured.status} startup=${startup} " +
+            "attempts=${captured.attempts} unavailable=${captured.unavailableCount} lockSeen=${captured.lockSeen} " +
+            "listener=${listener} listenerExit=${code}")
+        println("gateway_formal_evidence basename=${home.fileName}")
+    } catch (_: Exception) { () }
+}
+
 private class GatewayServeStopResourceCapture {
     var brokerStarted: Bool = false
     var brokerCaptured: Bool = false
@@ -5135,6 +5162,7 @@ public class GatewayServeLockLogicTest {
             var firstIdentity = None<GatewayServeIdentity>
             var businessEntered = false
             var allTerminal = false
+            var startupCaptureFailed = false
             let retainEvidence = getVariable("METIS_GATEWAY_FORMAL_RETAIN_EVIDENCE") == Some("1")
             try {
                 if (retainEvidence) {
@@ -5155,7 +5183,10 @@ public class GatewayServeLockLogicTest {
                     bin.join("lsof"),
                     ("#!/bin/sh\nif [ -f '${faultMarker.toString()}' ]; then\n" +
                         "  printf called > '${lsofCalled.toString()}'\n  sleep 1\n  exit 1\nfi\n" +
-                        "exec /usr/sbin/lsof \"$@\"\n").toArray()
+                        "printf started > '${home.join("listener-probe.started").toString()}' 2>/dev/null || :\n" +
+                        "/usr/sbin/lsof \"$@\"\nlistener_rc=$?\n" +
+                        "printf '%s\\n' \"$listener_rc\" > '${home.join("listener-probe.exit").toString()}' 2>/dev/null || :\n" +
+                        "exit \"$listener_rc\"\n").toArray()
                 )
                 @Expect(executeWithOutput("/bin/chmod", ["700", bin.join("lsof").toString()])[0], 0)
                 File.writeTo(
@@ -5168,7 +5199,7 @@ public class GatewayServeLockLogicTest {
                         "export METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_NONCE=heartbeat-e2e-v1\n" +
                         "export METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_POLLS=2\n" +
                         "unset METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER\n" +
-                        "exec \"$1\" gateway run 2>\"$2\"\n").toArray()
+                        "exec \"$1\" gateway run >\"$3\" 2>\"$2\"\n").toArray()
                 )
                 @Expect(executeWithOutput("/bin/chmod", ["700", launchWrapper.toString()])[0], 0)
                 setVariable("PATH", "${bin.toString()}:${inheritedPath}")
@@ -5201,12 +5232,16 @@ public class GatewayServeLockLogicTest {
                         try { remove(home.join("gateway-serve.stop-complete")) } catch (_: Exception) { () }
                     }
                     let stderrPath = home.join("gateway-${generation}.stderr.log")
+                    let stdoutPath = home.join("gateway-${generation}.stdout.log")
+                    for (name in ["listener-probe.started", "listener-probe.exit"]) {
+                        if (exists(home.join(name))) { remove(home.join(name)) }
+                    }
                     let brokerDiagnosticPath = home.join("gateway-${generation}.broker-diagnostics")
                     Directory.create(brokerDiagnosticPath, recursive: true)
                     setVariable("METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER", brokerDiagnosticPath.toString())
                     let launched = launch(
                         launchWrapper.toString(),
-                        [metisBinary.toString(), stderrPath.toString()],
+                        [metisBinary.toString(), stderrPath.toString(), stdoutPath.toString()],
                         stdIn: ProcessRedirect.Discard,
                         stdOut: ProcessRedirect.Discard,
                         stdErr: ProcessRedirect.Discard
@@ -5218,7 +5253,11 @@ public class GatewayServeLockLogicTest {
                         home, launched, metisBinary, 15000)
                     @Expect(capturedIdentity.status, "captured")
                     @Expect(capturedIdentity.attempts > 0, true)
-                    if (capturedIdentity.status != "captured") { return }
+                    if (capturedIdentity.status != "captured") {
+                        startupCaptureFailed = true
+                        gatewayHeartbeatPrintStartupCaptureDiagnostic(home, generation, capturedIdentity)
+                        return
+                    }
                     @Expect(capturedIdentity.identity.isSome(), true)
                     if (!capturedIdentity.identity.isSome()) { return }
                     gatewayIdentity = capturedIdentity.identity
@@ -5475,12 +5514,12 @@ public class GatewayServeLockLogicTest {
                 CliConfig.invalidatePathCache()
                 MetisConfigManager.invalidate()
                 CliSettingManager.invalidate()
-                if (!retainEvidence) {
+                if (!retainEvidence && !startupCaptureFailed) {
                     try { remove(home, recursive: true) } catch (_: Exception) { () }
                 }
                 @Expect(dependenciesStopped, true)
                 if (businessEntered) { @Expect(allTerminal, true) }
-                if (!retainEvidence) { @Expect(exists(home), false) }
+                if (!retainEvidence && !startupCaptureFailed) { @Expect(exists(home), false) }
             }
         }
     }
