@@ -627,3 +627,146 @@ for (const descriptor of [0, 1]) {
     }
   });
 }
+
+
+// This exercises the historical test wrapper, not a second broker implementation.
+// Birth files below reuse this suite's explicitly algorithm-only birth() helper;
+// actual OS identity verification remains the Cangjie formal cases' responsibility.
+async function historicalWrapperMode(mode, businessExit = 0) {
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'metis-hr-broker-mode-'));
+  const nonce = `${process.pid}-${Date.now()}-${home.split('/').at(-1)}`;
+  const directory = join(home, 'inventory'), key = 'b-historical-mode';
+  const wrapper = fileURLToPath(new URL('./gateway-historical-recovery-broker-nonzero.mjs', import.meta.url));
+  const marker = join(home, 'business-marker');
+  writeFileSync(join(home, 'test-owned'), `historical-broker-mode-v1\n${nonce}\n`);
+  const bound = mode === 'bound-framed' || mode === 'attached';
+  const attached = mode === 'attached' || mode === 'unbound-attached';
+  const expectedOut = Buffer.concat([Buffer.from('中文😀\n'.repeat(8192)), Buffer.from([0, 255, 195, 40])]);
+  const expectedErr = Buffer.concat([Buffer.from('错误中文🙂\n'.repeat(8192)), Buffer.from([0, 254, 128])]);
+  const environment = { ...process.env };
+  for (const name of Object.keys(environment)) {
+    const upper = name.toUpperCase();
+    if (name.startsWith('METIS_PROCESS_RECOVERY_') || upper.includes('TOKEN') || upper.includes('CREDENTIAL') ||
+        upper.includes('PROXY') || upper.endsWith('_API_KEY') || upper.endsWith('_ACCESS_KEY_ID') ||
+        ['NODE_OPTIONS', 'NODE_PATH', 'BASH_ENV', 'ENV'].includes(name)) delete environment[name];
+  }
+  environment.METIS_HR_REAL_BROKER = script;
+  if (bound) {
+    mkdirSync(directory);
+    publishRecoveryFact(directory, key, 'intent', parent);
+    Object.assign(environment, { METIS_PROCESS_RECOVERY_DIRECTORY: directory,
+      METIS_PROCESS_RECOVERY_PARENT: parent, METIS_PROCESS_RECOVERY_BROKER_KEY: key });
+  }
+  const business = 'const fs=require("fs");fs.writeFileSync(process.argv[1],String(process.pid));' +
+    'process.stdout.write(Buffer.concat([Buffer.from("中文😀\\n".repeat(8192)),Buffer.from([0,255,195,40])]));' +
+    'process.stderr.write(Buffer.concat([Buffer.from("错误中文🙂\\n".repeat(8192)),Buffer.from([0,254,128])]));' +
+    `process.exitCode=${businessExit};`;
+  let child, owner = 0, launchPending = false, observedClose = false, code = null, signal = null;
+  let formal = false, proofSaved = false, bodyFailure;
+  const stdout = [], stderr = [], frames = [];
+  let pending = Buffer.alloc(0), protocolError = '';
+  const deadline = Date.now() + 5000;
+  const wait = async predicate => {
+    const remaining = deadline - Date.now();
+    return remaining > 0 && await until(predicate, remaining);
+  };
+  try {
+    launchPending = true;
+    child = spawn(process.execPath, [wrapper, ...(attached ? ['--attached', process.execPath, '-e', business, marker] : [])], {
+      detached: true, env: environment, stdio: ['pipe', 'pipe', 'pipe'] });
+    launchPending = false;
+    child.once('error', () => { protocolError = 'wrapper_spawn_failed'; });
+    child.once('close', (exit, stoppedSignal) => { code = exit; signal = stoppedSignal; observedClose = true; });
+    child.stdin.on('error', () => {});
+    child.stdout.on('data', chunk => {
+      stdout.push(chunk);
+      if (attached) return;
+      pending = Buffer.concat([pending, chunk]);
+      for (;;) {
+        const newline = pending.indexOf(10);
+        if (newline < 0) break;
+        const line = pending.subarray(0, newline); pending = pending.subarray(newline + 1);
+        try { frames.push(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(line))); }
+        catch { protocolError = 'wrapper_frame_invalid'; }
+      }
+    });
+    child.stderr.on('data', chunk => { stderr.push(chunk); });
+    if (bound) {
+      assert(await wait(() => spawnedPid(directory, key) === child.pid), 'wrapper_spawn_not_observed');
+      birth(directory, key, child.pid, 0);
+    }
+    if (!attached) {
+      assert(await wait(() => frames.some(frame => frame.type === 'broker.hello')), 'wrapper_hello_missing');
+      child.stdin.end();
+    } else if (bound) {
+      assert(await wait(() => spawnedPid(directory, `${key}-o-1`) > 0), 'wrapper_owner_not_observed');
+      owner = spawnedPid(directory, `${key}-o-1`);
+      assert(!existsSync(marker), 'wrapper_business_before_ack');
+      birth(directory, `${key}-o-1`, owner, owner);
+    }
+    assert(await wait(() => observedClose), 'wrapper_close_timeout');
+    assert.equal(protocolError, ''); assert.equal(signal, null);
+    assert.equal(code, mode === 'bound-framed' ? 70 : mode === 'unbound-attached' ? 64 : attached ? businessExit : 0);
+    if (!attached) {
+      assert.equal(frames.filter(frame => frame.type === 'broker.hello').length, 1);
+      assert.equal(frames.filter(frame => frame.type === 'broker.closed').length, 1);
+      assert.equal(frames.find(frame => frame.type === 'broker.hello').pid, child.pid);
+      assert.equal(frames.find(frame => frame.type === 'broker.closed').ownerCount, 0);
+      assert.equal(pending.length, 0); assert.equal(Buffer.concat(stderr).length, 0);
+      assert(!existsSync(marker));
+    } else if (bound) {
+      assert.deepEqual(Buffer.concat(stdout), expectedOut);
+      assert.deepEqual(Buffer.concat(stderr), expectedErr);
+      assert.equal(Number(readFileSync(marker, 'utf8')), owner);
+      assert(!groupPresent(owner));
+    } else {
+      assert.equal(Buffer.concat(stdout).length, 0);
+      assert.equal(Buffer.concat(stderr).toString('utf8'), 'historical broker fixture initialization failed\n');
+      assert(!existsSync(marker)); assert(!existsSync(directory));
+    }
+    if (bound) assert(existsSync(join(directory, `${key}.terminal`)), 'wrapper_terminal_missing');
+    assert(!pidPresent(child.pid)); assert(!groupPresent(child.pid));
+    assert(Date.now() <= deadline, 'wrapper_body_deadline_exceeded');
+    formal = true;
+  } catch (error) { bodyFailure = error; }
+  finally {
+    try {
+      writeFileSync(join(home, 'stdout.bin'), Buffer.concat(stdout));
+      writeFileSync(join(home, 'stderr.bin'), Buffer.concat(stderr));
+      writeFileSync(join(home, 'formal-before-fallback.json'), JSON.stringify({ nonce, mode, businessExit,
+        formal, bodyFailure: Boolean(bodyFailure), launchPending, observedClose, helperPid: child?.pid ?? 0,
+        ownerPid: owner, code, signal, algorithmBirthOnly: true }) + '\n');
+      proofSaved = true;
+    } catch (error) { bodyFailure ??= error; }
+    finally {
+      const cleanupDeadline = Date.now() + 5000;
+      try {
+        if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+      } catch (error) { bodyFailure ??= error; }
+      try {
+        const remaining = cleanupDeadline - Date.now();
+        assert(remaining > 0 && await until(() => !launchPending && observedClose && Boolean(child?.pid) &&
+          !pidPresent(child.pid) && !groupPresent(child.pid) && (!owner || !groupPresent(owner)), remaining),
+          'wrapper_cleanup_pending');
+        assert(Date.now() <= cleanupDeadline, 'wrapper_cleanup_deadline_exceeded');
+      } catch (error) { bodyFailure ??= error; }
+      // Never erase a failed input or let fallback supply formal truth.
+      console.log(`historical_wrapper_registry=${home.split('/').at(-1)};mode=${mode};formal=${formal};proofSaved=${proofSaved}`);
+    }
+  }
+  if (bodyFailure) throw bodyFailure;
+  assert(formal && proofSaved);
+}
+
+test('R-HR-FIXTURE-U1 unbound framed discovery preserves clean exit0', async () => {
+  await historicalWrapperMode('unbound-framed');
+});
+test('R-HR-FIXTURE-B1 fully bound framed close injects actual exit70', { skip: process.platform !== 'darwin' }, async () => {
+  await historicalWrapperMode('bound-framed');
+});
+test('R-HR-FIXTURE-P1 attached wrapper preserves raw bytes and genuine exit0 7 127', { skip: process.platform !== 'darwin' }, async () => {
+  for (const code of [0, 7, 127]) await historicalWrapperMode('attached', code);
+});
+test('R-HR-FIXTURE-N1 attached without recovery context cannot run business', async () => {
+  await historicalWrapperMode('unbound-attached');
+});

@@ -9,8 +9,19 @@ if (!isAbsolute(source)) {
   process.exit(64);
 }
 try {
-  const { runBroker } = await import(pathToFileURL(source).href);
-  runBroker({ exit: (code) => process.exit(code === 0 ? 70 : code) });
+  const { runBroker, runAttachedBroker } = await import(pathToFileURL(source).href);
+  if (process.argv[2] === '--attached') {
+    runAttachedBroker(process.argv[3], process.argv.slice(4));
+  } else {
+    let broker;
+    broker = runBroker({ exit: (code) => {
+      // The real constructor validates the header/binding and publishes this broker's spawn.
+      // Unbound pre-serve discovery and pre-return failures keep the original exit result.
+      const generationBound = Boolean(broker && broker.recoveryDirectory && broker.recoveryParent &&
+        broker.recoveryKey && broker.recoveryBinding && !broker.recoveryPersistenceFailed);
+      process.exit(code === 0 && generationBound ? 70 : code);
+    } });
+  }
 } catch {
   process.stderr.write('historical broker fixture initialization failed\n');
   process.exit(64);
