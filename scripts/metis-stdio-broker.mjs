@@ -633,7 +633,10 @@ export class StdioBroker {
     exit = (code) => process.exit(code),
     parentPidProvider = () => process.ppid,
     attachedStdio = false,
-    diagnosticMarkerDirectory = testMode ? process.env.METIS_STDIO_BROKER_DIAGNOSTIC_MARKER ?? '' : '' } = {}) {
+    diagnosticMarkerDirectory = testMode && !attachedStdio &&
+      (process.env.METIS_TEST_STDIO_BROKER_RECOVERY_DIAGNOSTICS_ONLY !== '1' ||
+        Boolean(process.env.METIS_PROCESS_RECOVERY_DIRECTORY))
+      ? process.env.METIS_STDIO_BROKER_DIAGNOSTIC_MARKER ?? '' : '' } = {}) {
     this.generation = generation;
     this.attachedStdio = attachedStdio;
     this.attachedBusinessEnv = attachedStdio ? attachedBusinessEnvironment(process.env, platform) : null;
