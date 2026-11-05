@@ -11,7 +11,7 @@ import metis.program_support.{
     programSupportCliSubagentNoticesFromGatewayStreamResult
 }
 
-import std.sync.AtomicBool
+import std.sync.{AtomicBool, Mutex}
 import stdx.encoding.json.{JsonObject, JsonValue}
 
 private let CLI_SUBAGENT_NOTICE_EVENT_KIND = "session.subagent.notice"
@@ -36,6 +36,8 @@ protected class CliSubagentNoticeWatcher {
     private let sessionKey: String
     private let stopRequested = AtomicBool(false)
     private var future: Option<Future<Unit>> = None
+    private let lifecycle = Mutex()
+    private let workerSettled = AtomicBool(false)
 
     init(sessionKey: String) {
         this.sessionKey = sessionKey.trimAscii()
@@ -43,22 +45,33 @@ protected class CliSubagentNoticeWatcher {
     }
 
     func start(): Unit {
-        if (this.future.isSome()) {
-            return
-        }
-        this.future = spawn {
-            while (!this.stopRequested.load() && !Thread.currentThread.hasPendingCancellation) {
-                this.pollOnce()
-                sleep(Duration.millisecond * 700)
+        synchronized(this.lifecycle) {
+            if (this.future.isSome() || this.stopRequested.load()) { return }
+            this.future = spawn {
+                try {
+                    while (!this.stopRequested.load() && !Thread.currentThread.hasPendingCancellation) {
+                        this.pollOnce()
+                        if (!this.stopRequested.load() && !Thread.currentThread.hasPendingCancellation) {
+                            sleep(Duration.millisecond * 700)
+                        }
+                    }
+                } finally { this.workerSettled.store(true) }
             }
         }
     }
 
-    func stop(): Unit {
+    func stop(timeout!: Duration = Duration.second * 2): Bool {
         this.stopRequested.store(true)
-        if (let Some(f) <- this.future) {
+        let snapshot = synchronized(this.lifecycle) { this.future }
+        if (let Some(f) <- snapshot) {
             f.cancel()
+            // A cancellation request, an exceptional get, or only a finally
+            // marker is not a successful join receipt. Keep this owner pending.
+            if (timeout <= Duration.Zero) { return false }
+            try { f.get(timeout) } catch (_: Exception) { return false }
+            return this.workerSettled.load()
         }
+        true
     }
 
     private func pollOnce(): Unit {
@@ -86,10 +99,4 @@ protected class CliSubagentNoticeWatcher {
         PrintUtils.printLine(PrintUtils.renderAssistantResponseBox(notice))
         PrintUtils.printLine("")
     }
-}
-
-protected func startCliSubagentNoticeWatcher(): CliSubagentNoticeWatcher {
-    let watcher = CliSubagentNoticeWatcher("main")
-    watcher.start()
-    watcher
 }

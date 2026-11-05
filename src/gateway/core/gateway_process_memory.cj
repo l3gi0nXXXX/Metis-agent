@@ -1,7 +1,8 @@
 package metis.gateway.core
 
+import metis.process.managedRecoveryExecuteWithOutput
+
 import std.convert.Parsable
-import std.process.executeWithOutput
 import std.runtime.{getAllocatedHeapSize, getMaxHeapSize, getUsedHeapSize}
 import std.sync.Mutex
 import std.time.MonoTime
@@ -540,7 +541,7 @@ public func gatewayProcessResidentSetKb(): Int64 {
         return -1
     }
     try {
-        let (exitCode, stdout, _) = executeWithOutput("ps", ["-o", "rss=", "-p", "${pid}"])
+        let (exitCode, stdout, _) = managedRecoveryExecuteWithOutput("ps", ["-o", "rss=", "-p", "${pid}"])
         if (exitCode != 0) {
             return -1
         }

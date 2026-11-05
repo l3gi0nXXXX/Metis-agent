@@ -2,7 +2,7 @@ package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager}
 import metis.gateway.core.GatewayStopResult
-import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, parseProcessInstanceIdentity, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, publishExclusiveUtf8File, signalProcessInstance}
+import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, parseProcessInstanceIdentity, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, publishExclusiveUtf8File, signalProcessInstance, managedRecoveryProbeRecords}
 import metis.utils.{InfoUtils, SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, ShellTimeoutException, ShellUtils}
 
 import std.collection.{ArrayList, HashSet}
@@ -158,8 +158,19 @@ private var gatewayServePortProbeForTest: Option<(Int64, Int64) -> (Int64, Strin
 /** Test-only synchronous probe seam. None preserves the production ShellUtils path. */
 public func setGatewayServePortProbeForTest(
     probe: Option<(Int64, Int64) -> (Int64, String, String)>
-): Unit {
-    synchronized(gatewayServePortProbeLock) { gatewayServePortProbeForTest = probe }
+): Option<(Int64, Int64) -> (Int64, String, String)> {
+    synchronized(gatewayServePortProbeLock) {
+        let previous = gatewayServePortProbeForTest
+        gatewayServePortProbeForTest = probe
+        previous
+    }
+}
+
+/** The explicit probe seam has no broker dependency. Production probes use the selected client. */
+func gatewayServePortProbeInternalArtifactsValid(): Bool {
+    if (synchronized(gatewayServePortProbeLock) { gatewayServePortProbeForTest.isSome() }) { return true }
+    ShellUtils.capturedInternalArtifactsValid(
+        requireNativeGate: InfoUtils.os == "macos" && gatewayCrashRecoveryPlatformSupported())
 }
 
 public class GatewayServeIdentity {
@@ -668,6 +679,12 @@ public func gatewayParseServeStopRequestIdentity(text: String): Option<GatewaySe
 }
 
 private func gatewayWriteServeStopRequest(identity: GatewayServeIdentity): Bool {
+    let claim = gatewayAcquireServeMutationClaim(MonoTime.now() + Duration.second * 3)
+    if (!claim.ok) { return false }
+    try { gatewayWriteServeStopRequestUnderClaim(identity) } finally { claim.release() }
+}
+
+private func gatewayWriteServeStopRequestUnderClaim(identity: GatewayServeIdentity): Bool {
     match (gatewayReadServeIdentity()) {
         case Some(current) => if (!current.matches(identity)) { return false }
         case None => return false
@@ -703,6 +720,12 @@ public func gatewayServeStopRequested(identity: GatewayServeIdentity): Bool {
 }
 
 private func gatewayRemoveServeStopRequest(expected: GatewayServeIdentity): Bool {
+    let claim = gatewayAcquireServeMutationClaim(MonoTime.now() + Duration.second * 3)
+    if (!claim.ok) { return false }
+    try { gatewayRemoveServeStopRequestUnderClaim(expected) } finally { claim.release() }
+}
+
+private func gatewayRemoveServeStopRequestUnderClaim(expected: GatewayServeIdentity): Bool {
     let path = gatewayServeStopRequestPath()
     try {
         if (!exists(path)) { return true }
@@ -931,6 +954,12 @@ public func gatewayServePortReleasedUntil(port: Int64, deadline: MonoTime): Gate
  * 若锁内 PID 已退出，会删除陈旧锁文件并返回 false。
  */
 public func gatewayAnotherServeInstanceSeemsRunning(): Bool {
+    let claim = gatewayAcquireServeMutationClaim(MonoTime.now() + Duration.second * 2)
+    if (!claim.ok) { return true }
+    try { gatewayAnotherServeInstanceUnderClaim() } finally { claim.release() }
+}
+
+private func gatewayAnotherServeInstanceUnderClaim(): Bool {
     let listeners = gatewayFindVerifiedListenerPidsOnPortDetailed()
     if (listeners.pids.size > 0) {
         return true
@@ -956,6 +985,14 @@ public func gatewayAnotherServeInstanceSeemsRunning(): Bool {
                     case None => gatewayServePidProbe(pid, 500)
                 }
                 if (!probe.conclusive || probe.alive) { return true }
+                if (gatewayCrashRecoveryPlatformSupported()) {
+                    if (let Some(identity) <- gatewayParseCrashLockStrict(text)) {
+                        if (!exists(gatewayServeCompletionPath()) ||
+                            (exists(gatewayRecoveryInventoryPath(identity)) && !gatewayServeExitHasDurableEvidence(identity))) {
+                            return !gatewayReconcileCrashRecovery(MonoTime.now() + Duration.second * 2).ok
+                        }
+                    }
+                }
                 match (gatewayParseServeIdentity(text)) {
                     case Some(identity) => let _ = gatewayRemoveServeLockFile(expected: Some(identity))
                     case None => let _ = gatewayRemoveServeLockFile()
@@ -989,6 +1026,12 @@ public func gatewayRefreshServeLockMtime(): Unit {
 }
 
 private func gatewayRemoveServeLockFile(expected!: Option<GatewayServeIdentity> = None<GatewayServeIdentity>): Bool {
+    let claim = gatewayAcquireServeMutationClaim(MonoTime.now() + Duration.second * 2)
+    if (!claim.ok) { return false }
+    try { gatewayRemoveServeLockUnderClaim(expected: expected) } finally { claim.release() }
+}
+
+private func gatewayRemoveServeLockUnderClaim(expected!: Option<GatewayServeIdentity> = None<GatewayServeIdentity>): Bool {
     let p = gatewayServeLockPath()
     try {
         if (!exists(p)) { return true }
@@ -1008,10 +1051,20 @@ private func gatewayRemoveServeLockFile(expected!: Option<GatewayServeIdentity> 
 }
 
 /** 供 `runGatewayService` 在 `finally` 中调用（Ctrl+C 未必走 atExit）。 */
+func gatewayServeExitHasDurableEvidence(identity: GatewayServeIdentity): Bool {
+    if (!exists(gatewayRecoveryInventoryPath(identity))) { return true }
+    let completion = gatewayReadServeCompletion(identity)
+    if (!completion.found || completion.status != "graceful" || !completion.fullTerminal || identity.processIdentity.isNone()) { return false }
+    let inventory = managedRecoveryProbeRecords(gatewayRecoveryInventoryPath(identity),
+        identity.processIdentity.getOrThrow().serialize(), identity.nonce, MonoTime.now() + Duration.second)
+    inventory.ok && inventory.terminal
+}
+
 public func gatewayReleaseServeLockQuiet(): Unit {
     let active = synchronized(gatewayServeIdentityLock) { gatewayActiveServeIdentity }
     match (active) {
         case Some(identity) =>
+            if (!gatewayServeExitHasDurableEvidence(identity)) { return }
             let _ = gatewayRemoveServeLockFile(expected: Some(identity))
             let _ = gatewayRemoveServeStopRequest(identity)
             synchronized(gatewayServeIdentityLock) {
@@ -1025,6 +1078,7 @@ public func gatewayReleaseServeLockQuiet(): Unit {
 }
 
 public func gatewayReleaseServeLockForIdentity(identity: GatewayServeIdentity): Bool {
+    if (!gatewayServeExitHasDurableEvidence(identity)) { return false }
     let removed = gatewayRemoveServeLockFile(expected: Some(identity))
     if (removed) {
         let _ = gatewayRemoveServeStopRequest(identity)
@@ -1216,6 +1270,25 @@ public func gatewayTryTerminateServeProcessUntil(pid: Int64, deadline: MonoTime)
         case None => return GatewayServeTerminationResult(false, "stale_identity")
     }
     if (identity.pid != pid) { return GatewayServeTerminationResult(false, "stale_identity") }
+    if (gatewayCrashRecoveryPlatformSupported() && identity.processIdentity.isSome() &&
+        (!exists(gatewayServeCompletionPath()) || (exists(gatewayRecoveryInventoryPath(identity)) && !gatewayServeExitHasDurableEvidence(identity)))) {
+        let parent = probeProcessInstance(identity.processIdentity.getOrThrow(), deadline)
+        if (parent.conclusive && !parent.alive) {
+            while (MonoTime.now() < deadline) {
+                let evidence = gatewayCollectCrashRecoveryEvidence(deadline)
+                if (evidence.status == "recoverable") {
+                    let recovered = gatewayCommitCrashRecovery(evidence, deadline)
+                    return GatewayServeTerminationResult(recovered.ok, recovered.status, pidStatus: parent.status)
+                }
+                if (!["resource_alive", "resource_group_active_or_unknown", "resource_intent_incomplete", "resource_identity_unknown",
+                    "inventory_changing", "pid_alive", "port_active"].contains(evidence.status)) {
+                    return GatewayServeTerminationResult(false, evidence.status, pidStatus: parent.status)
+                }
+                sleep(Duration.millisecond * 25)
+            }
+            return GatewayServeTerminationResult(false, "recovery_deadline_exceeded", pidStatus: parent.status)
+        }
+    }
     let remaining = (deadline - MonoTime.now()).toMilliseconds()
     if (remaining <= 0) { return GatewayServeTerminationResult(false, "cleanup_pending", pidStatus: "deadline_exceeded") }
     let result = gatewayTerminateServeProcessWithPolicy(
@@ -1251,6 +1324,12 @@ public func gatewayTryTerminateServeProcessUntil(pid: Int64, deadline: MonoTime)
  * 成功时注册 `atExit` 清理锁文件（Ctrl+C 不一定触发 atExit，故 `runGatewayService` 另用 try/finally）。
  */
 public func gatewayAcquireServeLockForRunningProcess(): Bool {
+    let claim = gatewayAcquireServeMutationClaim(MonoTime.now() + Duration.second * 3)
+    if (!claim.ok) { return false }
+    try { gatewayAcquireServeLockUnderClaim() } finally { claim.release() }
+}
+
+private func gatewayAcquireServeLockUnderClaim(): Bool {
     let completionPath = gatewayServeCompletionPath()
     if (exists(completionPath)) {
         match (gatewayReadLockText(completionPath)) {
@@ -1260,6 +1339,18 @@ public func gatewayAcquireServeLockForRunningProcess(): Bool {
                     return false
                 }
             case None => return false
+        }
+    }
+    // Current inventory recovery must archive the original request before any
+    // legacy stale-request removal. Only its strict commit may retire these facts.
+    if (gatewayCrashRecoveryPlatformSupported()) {
+        if (let Some(text) <- gatewayReadLockText(gatewayServeLockPath())) {
+            if (let Some(old) <- gatewayParseCrashLockStrict(text)) {
+                if (old.processIdentity.isSome() && exists(gatewayRecoveryInventoryPath(old)) &&
+                    !gatewayServeExitHasDurableEvidence(old)) {
+                    if (!gatewayReconcileCrashRecovery(MonoTime.now() + Duration.second * 2).ok) { return false }
+                }
+            }
         }
     }
     let requestPath = gatewayServeStopRequestPath()
@@ -1311,8 +1402,10 @@ public func gatewayAcquireServeLockForRunningProcess(): Bool {
             }
         }
         atExit({ =>
-            let _ = gatewayRemoveServeLockFile(expected: Some(identity))
-            let _ = gatewayRemoveServeStopRequest(identity)
+            if (gatewayServeExitHasDurableEvidence(identity)) {
+                let _ = gatewayRemoveServeLockFile(expected: Some(identity))
+                let _ = gatewayRemoveServeStopRequest(identity)
+            }
         })
         return true
     } catch (_e: Exception) {

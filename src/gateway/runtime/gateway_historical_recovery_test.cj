@@ -5,13 +5,13 @@ import metis.gateway.core.GatewayStopResult
 import metis.gateway.logging.{gatewayLoggingResetForTest, gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, MetisLogEvent}
 import stdx.encoding.json.JsonValue
 import metis.gateway.service_plugin.{setServicePluginPidProbeCommandForTest, setServicePluginPortReleaseCommandForTest}
-import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, resetManagedStdioBrokerForTest}
+import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, resetManagedStdioBrokerForTest, managedRecoveryContext, managedRecoveryProbeRecords, managedStdioBroker}
 import std.core.Duration
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, FileInfo, Path, exists, remove}
+import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists, remove}
 import std.net.{IPSocketAddress, TcpServerSocket}
 import std.process.executeWithOutput
-import std.sync.AtomicInt64
+import std.sync.{AtomicBool, AtomicInt64}
 import std.time.{DateTime, MonoTime}
 import std.unittest.testmacro.*
 
@@ -155,42 +155,137 @@ public class GatewayHistoricalPendingRecoveryTest {
 
     @TestCase
     public func hr30E2eRestartReconcilesPendingSnapshotBeforeLaunch(): Unit {
+        let actionReturned = AtomicBool(false)
+        let cleanupAllowed = AtomicBool(false)
         hrRuntimeHome({ home, identity =>
             let original = hr30WritePendingMarker(home, identity)
             let lease = hrRuntimeWriteLease(home, identity, state: "running")
             let leaseBytes = File.readFrom(lease)
-            @Expect(gatewayExecuteStopServe(), 0)
-            @Expect(String.fromUtf8(File.readFrom(home.join("gateway-serve.stop-complete"))), original)
-            @Expect(exists(home.join("gateway-serve.recovery-history")), false)
+            @Assert(gatewayExecuteStopServe(), 0)
+            @Assert(String.fromUtf8(File.readFrom(home.join("gateway-serve.stop-complete"))), original)
+            @Assert(exists(home.join("gateway-serve.recovery-history")), false)
             let launches = AtomicInt64(0)
-            @Expect(gatewayExecuteRestartServe(launchServe: { =>
-                launches.fetchAdd(1)
-                gatewayAcquireServeLockForRunningProcess()
-            }), 0)
-            @Expect(launches.load(), 1)
-            @Expect(gatewayOwnsCurrentServeLock(), true)
-            @Expect(exists(home.join("gateway-serve.stop-complete")), false)
-            @Expect(File.readFrom(lease), leaseBytes)
-            gatewayReleaseServeLockQuiet()
-            @Expect(gatewayPendingServeCompletionStatus(), "missing")
-            @Expect(gatewayAcquireServeLockForRunningProcess(), true)
-            var archived: Int64 = 0
-            for (entry in Directory.readFrom(home.join("gateway-serve.recovery-history"))) {
-                if (entry.name.endsWith(".completion")) {
-                    archived += 1
-                    @Expect(String.fromUtf8(File.readFrom(entry.path)), original)
+            let synthetic = HrRuntimeSyntheticReadyServe()
+            try {
+                @Assert(gatewayExecuteRestartServe(launchServe: { =>
+                    launches.fetchAdd(1)
+                    synthetic.start()
+                }), 0)
+                @Assert(launches.load(), 1)
+                @Assert(gatewayOwnsCurrentServeLock(), true)
+                @Assert(exists(home.join("gateway-serve.stop-complete")), false)
+                @Assert(File.readFrom(lease), leaseBytes)
+                @Assert(synthetic.finish(), true)
+                gatewayReleaseServeLockQuiet()
+                @Assert(gatewayPendingServeCompletionStatus(), "missing")
+                @Assert(gatewayAcquireServeLockForRunningProcess(), true)
+                var archived: Int64 = 0
+                for (entry in Directory.readFrom(home.join("gateway-serve.recovery-history"))) {
+                    if (entry.name.endsWith(".completion")) {
+                        archived += 1
+                        @Assert(String.fromUtf8(File.readFrom(entry.path)), original)
+                    }
                 }
+                @Assert(archived, 1)
+                actionReturned.store(true)
+            } finally {
+                let finished = synthetic.finish()
+                cleanupAllowed.store(actionReturned.load() && finished && synthetic.cleanupMayBeRemoved())
+                @Expect(finished, true)
             }
-            @Expect(archived, 1)
-        })
+        }, cleanupAdmission: { => actionReturned.load() && cleanupAllowed.load() })
     }
 }
 
-func hrRuntimeHome(block: (Path, GatewayServeIdentity) -> Unit): Unit {
+// This test double launches no Gateway components or business owners. It still
+// publishes the real inventory/ready contract and retires only its own generation.
+class HrRuntimeSyntheticReadyServe {
+    private let previousDirectory = getVariable("METIS_PROCESS_RECOVERY_DIRECTORY")
+    private let previousParent = getVariable("METIS_PROCESS_RECOVERY_PARENT")
+    private var identity: Option<GatewayServeIdentity> = None
+    private var scope: Option<GatewayRecoveryLaunchScope> = None
+    private var completed = false
+    private var launchAttempted = false
+    private var finishFailed = false
+
+    init() {
+        File.writeTo(CliConfig.dotDir.join("hr-synthetic-generation.started"), "prelaunch".toArray())
+    }
+
+    func start(): Bool {
+        this.launchAttempted = true
+        if (!gatewayAcquireServeLockForRunningProcess()) { return false }
+        let current = gatewayReadServeIdentity().getOrThrow()
+        this.identity = Some(current)
+        File.writeTo(CliConfig.dotDir.join("hr-synthetic-generation.started"), current.nonce.toArray())
+        if (!gatewayInitializeRecoveryInventory(current)) { return false }
+        this.scope = Some(GatewayRecoveryLaunchScope(managedRecoveryContext(), current.nonce,
+            this.previousDirectory, this.previousParent))
+        gatewayPublishServeReady(current)
+    }
+
+    func cleanupMayBeRemoved(): Bool { this.completed && !this.finishFailed }
+
+    func finish(): Bool {
+        let result = this.finishOnce()
+        if (!result) { this.finishFailed = true }
+        result
+    }
+
+    private func finishOnce(): Bool {
+        if (this.completed) { return true }
+        if (this.identity.isNone()) { return !this.launchAttempted }
+        let deadline = MonoTime.now() + Duration.second * 3
+        try {
+            let current = this.identity.getOrThrow()
+            let owner = this.scope.getOrThrow()
+            let active = gatewayReadServeIdentity()
+            if (active.isNone() || !active.getOrThrow().matches(current)) { return false }
+            owner.closeAdmission()
+            if (!owner.stopOwnedChildren(deadline)) { return false }
+            let proof = managedRecoveryProbeRecords(gatewayRecoveryInventoryPath(current),
+                current.processIdentity.getOrThrow().serialize(), current.nonce, deadline)
+            if (!proof.ok || !proof.terminal) { return false }
+            let broker = managedStdioBroker().snapshot()
+            if (broker.running || broker.brokerPid != 0 || broker.ownerCount != 0 ||
+                broker.readerCount != 0 || broker.dispatcherCount != 0) { return false }
+            // No server/channel/plugin surfaces were constructed by this double.
+            let stopped = GatewayStopResult(true, "stopped", inboundStatus: "not_applicable",
+                ownersStatus: "not_applicable", compatStatus: "not_applicable", sidecarStatus: "not_applicable",
+                servicePluginStatus: "not_applicable", servicePluginIngressStatus: "not_applicable",
+                servicePluginDispatchStatus: "not_applicable", servicePluginOwnerStatus: "not_applicable",
+                servicePluginLeaseStatus: "not_applicable", servicePluginPortStatus: "not_applicable",
+                channelsStatus: "not_applicable", brokerStatus: "not_applicable")
+            if (!gatewayWriteServeCompletionMarker(current, stopped)) { return false }
+            let path = CliConfig.dotDir.join("gateway-serve.stop-complete")
+            let text = String.fromUtf8(File.readFrom(path))
+            let completion = gatewayParseServeCompletion(text, current)
+            if (!completion.found || completion.status != "graceful" || !completion.fullTerminal) { return false }
+            File.writeTo(CliConfig.dotDir.join("hr-synthetic-generation.completion.bin"), text.toArray())
+            gatewayReleaseServeLockQuiet()
+            if (gatewayReadServeIdentity().isSome()) { return false }
+            let claim = gatewayAcquireServeMutationClaim(deadline)
+            if (!claim.ok) { return false }
+            try {
+                if (gatewayReadServeIdentity().isSome() || String.fromUtf8(File.readFrom(path)) != text) { return false }
+                let unchanged = gatewayParseServeCompletion(text, current)
+                if (!unchanged.found || !unchanged.fullTerminal || unchanged.status != "graceful") { return false }
+                remove(path)
+            } finally { claim.release() }
+            if (!owner.restoreAfterTerminal(deadline) || MonoTime.now() > deadline) { return false }
+            File.writeTo(CliConfig.dotDir.join("hr-synthetic-generation.finished"), current.nonce.toArray())
+            this.completed = true
+            true
+        } catch (_: Exception) { false }
+    }
+}
+
+func hrRuntimeHome(block: (Path, GatewayServeIdentity) -> Unit, cleanupAdmission!: () -> Bool = { => true }): Unit {
     synchronized(MetisProcessEnvironmentLock) {
-        let home = Path("/tmp/metis-hr-runtime-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        let unresolvedHome = Path("/tmp/metis-hr-runtime-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
         let before = getVariable("METIS_HOME")
-        Directory.create(home, recursive: true)
+        Directory.create(unresolvedHome, recursive: true)
+        let home = canonicalize(unresolvedHome)
         setVariable("METIS_HOME", home.toString())
         CliConfig.invalidatePathCache()
         MetisConfigManager.invalidate()
@@ -221,8 +316,16 @@ func hrRuntimeHome(block: (Path, GatewayServeIdentity) -> Unit): Unit {
             CliConfig.invalidatePathCache()
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
-            remove(home, recursive: true)
-            @Expect(exists(home), false)
+            let started = home.join("hr-synthetic-generation.started")
+            let finished = home.join("hr-synthetic-generation.finished")
+            let syntheticTerminal = try {
+                !exists(started) || (exists(finished) &&
+                    String.fromUtf8(File.readFrom(started)) == String.fromUtf8(File.readFrom(finished)))
+            } catch (_: Exception) { false }
+            let cleanupAllowed = syntheticTerminal && cleanupAdmission()
+            if (cleanupAllowed) { remove(home, recursive: true) }
+            @Expect(cleanupAllowed, true)
+            @Expect(exists(home), !cleanupAllowed)
         }
     }
 }

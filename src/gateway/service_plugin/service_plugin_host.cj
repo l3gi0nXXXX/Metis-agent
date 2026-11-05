@@ -9,7 +9,7 @@ import metis.utils.{SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, ShellUtils}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.core.refEq
-import std.fs.{Directory, File, Path, exists, remove, rename}
+import std.fs.{Directory, File, FileInfo, Path, exists, remove, rename}
 import std.io.*
 import std.env.{getProcessId, getVariable, getVariables, setVariable}
 import std.process.*
@@ -675,17 +675,117 @@ private class ServicePluginRuntimeRecord {
 }
 
 private class ServicePluginSupervisorStopFlag {
+    public let serviceId: String
+    public let token: Int64
     private let lock = Mutex()
+    private var condition: Condition
     private var stoppedValue = false
+    private var workerId = None<Int64>
+    private var bodyFinished = false
+    private var waiting = false
+    private var future = None<Future<Unit>>
+
+    public init(serviceId: String, token: Int64) {
+        this.serviceId = serviceId
+        this.token = token
+        synchronized(this.lock) { this.condition = this.lock.condition() }
+    }
 
     public func stop(): Unit {
         synchronized(this.lock) {
             this.stoppedValue = true
+            this.condition.notifyAll()
         }
     }
 
-    public func stopped(): Bool {
-        synchronized(this.lock) { this.stoppedValue }
+    public func stopped(): Bool { synchronized(this.lock) { this.stoppedValue } }
+    public func isSelf(): Bool { synchronized(this.lock) { this.workerId == Some(Thread.currentThread.id) } }
+    public func entered(): Unit { synchronized(this.lock) { this.workerId = Some(Thread.currentThread.id) } }
+    public func finished(): Unit {
+        synchronized(this.lock) {
+            this.bodyFinished = true
+            this.waiting = false
+            this.condition.notifyAll()
+        }
+    }
+    public func attach(worker: Future<Unit>): Unit {
+        synchronized(this.lock) {
+            this.future = Some(worker)
+            this.condition.notifyAll()
+        }
+    }
+    public func waitInterval(intervalMs: Int64): Bool {
+        synchronized(this.lock) {
+            this.waiting = true
+            try {
+                if (!this.stoppedValue) {
+                    let _ = this.condition.waitUntil({ => this.stoppedValue },
+                        timeout: Duration.millisecond * intervalMs)
+                }
+                !this.stoppedValue
+            } finally { this.waiting = false }
+        }
+    }
+    public func state(): (Bool, Bool, Bool, Int64) {
+        synchronized(this.lock) { (this.future.isSome(), this.bodyFinished, this.waiting, this.workerId.getOrDefault { Int64(-1) }) }
+    }
+    public func tryJoined(): Bool {
+        let candidate = synchronized(this.lock) {
+            if (this.bodyFinished && this.workerId != Some(Thread.currentThread.id)) { this.future }
+            else { None<Future<Unit>> }
+        }
+        match (candidate) {
+            case Some(worker) =>
+                try { worker.tryGet().isSome() } catch (_: Exception) {
+                    servicePluginSupervisorWorkerFailed(this.serviceId)
+                    true
+                }
+            case None => false
+        }
+    }
+    public func awaitJoined(deadlineMs: Int64): Bool {
+        if (this.isSelf()) { return false }
+        let candidate = synchronized(this.lock) {
+            while (this.future.isNone()) {
+                let remaining = servicePluginDeadlineRemaining(deadlineMs)
+                if (remaining <= 0) { return false }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            this.future
+        }
+        match (candidate) {
+            case Some(worker) =>
+                let remaining = servicePluginDeadlineRemaining(deadlineMs)
+                if (remaining <= 0) { return false }
+                try {
+                    worker.get(Duration.millisecond * remaining)
+                    servicePluginDeadlineNowMs() <= deadlineMs
+                } catch (_: TimeoutException) {
+                    // A worker may itself throw TimeoutException; only the
+                    // nonblocking outcome can distinguish that from a wait timeout.
+                    this.tryJoined() && servicePluginDeadlineNowMs() <= deadlineMs
+                } catch (_: Exception) {
+                    servicePluginSupervisorWorkerFailed(this.serviceId)
+                    servicePluginDeadlineNowMs() <= deadlineMs
+                }
+            case None => false
+        }
+    }
+}
+
+// Fixed scalar test view. A finished body or absent Future is never a join proof.
+public class ServicePluginSupervisorOwnershipForTest {
+    public let owned: Int64
+    public let currentToken: Int64
+    public let awaitingAttach: Int64
+    public let bodyFinished: Int64
+    public let waiting: Int64
+    public init(owned: Int64, currentToken: Int64, awaitingAttach: Int64, bodyFinished: Int64, waiting: Int64) {
+        this.owned = owned
+        this.currentToken = currentToken
+        this.awaitingAttach = awaitingAttach
+        this.bodyFinished = bodyFinished
+        this.waiting = waiting
     }
 }
 
@@ -717,6 +817,9 @@ private var servicePluginBeforeStopClaimHookForTest: Option<(String) -> Unit> = 
 private var servicePluginSupervisorAutoStartForTest = true
 private var servicePluginSupervisorWorkers = HashMap<String, ServicePluginSupervisorStopFlag>()
 private let servicePluginSupervisorLock = Mutex()
+private let servicePluginSupervisorOwned = HashMap<Int64, ServicePluginSupervisorStopFlag>()
+private var servicePluginSupervisorNextToken: Int64 = 0
+private var servicePluginBeforeSupervisorAttachForTest = None<(String) -> Unit>
 
 private class ServicePluginLineBuffer {
     private let lock = Mutex()
@@ -2068,7 +2171,38 @@ private func servicePluginFlushDispatchDiagnostics(process: ServicePluginStdioPr
 
 public func servicePluginCleanupPendingCountForTest(): Int64 { synchronized(servicePluginProcessLock) { Int64(servicePluginCleanupPendingOwners.size) } }
 func servicePluginStartClaimCountForTest(): Int64 { synchronized(servicePluginProcessLock) { Int64(servicePluginStartClaims.size) } }
-public func servicePluginSupervisorWorkerCountForTest(): Int64 { synchronized(servicePluginSupervisorLock) { Int64(servicePluginSupervisorWorkers.size) } }
+public func servicePluginSupervisorWorkerCountForTest(): Int64 {
+    synchronized(servicePluginSupervisorLock) { Int64(servicePluginSupervisorOwned.size) }
+}
+
+public func servicePluginSupervisorOwnershipForTest(serviceId: String): ServicePluginSupervisorOwnershipForTest {
+    synchronized(servicePluginSupervisorLock) {
+        var owned: Int64 = 0
+        var unattached: Int64 = 0
+        var finished: Int64 = 0
+        var waiting: Int64 = 0
+        for ((_, flag) in servicePluginSupervisorOwned) {
+            if (flag.serviceId == serviceId) {
+                owned++
+                let state = flag.state()
+                if (!state[0]) { unattached++ }
+                if (state[1]) { finished++ }
+                if (state[2]) { waiting++ }
+            }
+        }
+        let current = match (servicePluginSupervisorWorkers.get(serviceId)) {
+            case Some(flag) => flag.token
+            case None => Int64(0)
+        }
+        ServicePluginSupervisorOwnershipForTest(owned, current, unattached, finished, waiting)
+    }
+}
+
+public func setServicePluginBeforeSupervisorAttachForTest(hook: Option<(String) -> Unit>): Option<(String) -> Unit> {
+    let previous = servicePluginBeforeSupervisorAttachForTest
+    servicePluginBeforeSupervisorAttachForTest = hook
+    previous
+}
 func servicePluginCleanupReadyIdleForTest(serviceId: String): Bool {
     synchronized(servicePluginProcessLock) {
         match (servicePluginCleanupPendingForServiceLocked(serviceId)) {
@@ -2164,28 +2298,15 @@ private func servicePluginSafePathDiagnostic(path: String): String {
     servicePluginSafeDiagnosticText(trimmed)
 }
 
-private func servicePluginBinaryMtimeDiagnostic(command: String): String {
+// Diagnostic metadata must not launch subprocesses on the plugin startup path.
+func servicePluginBinaryMtimeDiagnostic(command: String): String {
     let cmd = command.trimAscii()
-    if (cmd.isEmpty() || !exists(Path(cmd))) {
-        return "unavailable"
-    }
+    if (cmd.isEmpty()) { return "unavailable" }
     try {
-        let darwin = executeWithOutput("stat", ["-f", "%m", cmd])
-        if (darwin[0] == 0) {
-            return String.fromUtf8(darwin[1]).trimAscii()
-        }
+        FileInfo(Path(cmd)).lastModificationTime.toUnixTimeStamp().toSeconds().toString()
     } catch (_: Exception) {
-        ()
+        "unavailable"
     }
-    try {
-        let linux = executeWithOutput("stat", ["-c", "%Y", cmd])
-        if (linux[0] == 0) {
-            return String.fromUtf8(linux[1]).trimAscii()
-        }
-    } catch (_: Exception) {
-        ()
-    }
-    "unavailable"
 }
 
 private func servicePluginStartDiagnosticMeta(record: ServicePluginRuntimeRecord, pid: Int64, status: String, diagnostic!: String = ""): JsonObject {
@@ -2908,6 +3029,16 @@ private func cleanupDetachedServicePluginOwner(
             case None => ()
         }
     }
+    // An event pump using joinPump:false must never wait for the supervisor
+    // which may itself be waiting for that pump to close during recovery.
+    let supervisorsJoined = !joinPump || servicePluginAwaitSupervisorsUntil(sid, deadlineMs,
+        allowRecoverySelf: normalizedReason == "process_exited")
+    if (!supervisorsJoined) {
+        let meta = JsonObject()
+        meta.put("serviceId", JsonString(sid))
+        meta.put("diagnostic", JsonString("supervisor_cleanup_pending"))
+        servicePluginHostLogger.warn(MetisLogEvent.loggingRaw, "service_plugin.active_process.cleanup", meta: meta)
+    }
     if (detached.process.isSome() || detached.queue.isSome() || detached.pump.isSome()) {
         let meta = JsonObject()
         meta.put("serviceId", JsonString(sid))
@@ -3183,6 +3314,12 @@ public func dropServicePluginActiveProcessForTest(serviceId: String, stopProcess
 
 public func resetServicePluginHostForTest(): Unit {
     servicePluginExitedOwnerLeaseHookForTest = None<(String) -> Unit>
+    let supervisorOwnerIds = synchronized(servicePluginProcessLock) {
+        let ids = HashSet<String>()
+        for ((serviceId, _) in servicePluginActiveProcesses) { ids.add(serviceId) }
+        for ((_, slot) in servicePluginCleanupPendingOwners) { ids.add(slot.serviceId) }
+        ids
+    }
     stopAllServicePluginSupervisors()
     stopAllActiveServicePluginProcesses()
     let pendingCleanup = synchronized(servicePluginProcessLock) {
@@ -3210,6 +3347,18 @@ public func resetServicePluginHostForTest(): Unit {
             case None => ()
         }
     }
+    // reset had no aggregate deadline. Only orphan supervisors share this new,
+    // single 1000ms phase; detached owners consumed their original owner budget.
+    let supervisorDeadline = servicePluginDeadlineNowMs() + 1000
+    var supervisorsJoined = true
+    for (flag in servicePluginSupervisorOwnedSnapshot("")) {
+        let joined = if (supervisorOwnerIds.contains(flag.serviceId)) {
+            // The detached owner already consumed its own original deadline.
+            flag.tryJoined()
+        } else { flag.tryJoined() || flag.awaitJoined(supervisorDeadline) }
+        if (joined) { servicePluginRetireSupervisor(flag) } else { supervisorsJoined = false }
+    }
+    if (!supervisorsJoined) { throw Exception("service_plugin_test_reset_supervisor_cleanup_pending") }
     synchronized(servicePluginProcessLock) {
         servicePluginCleanupPendingOwners = HashMap<String, ServicePluginCleanupPendingSlot>()
         servicePluginRegistry = HashMap<String, ServicePluginRuntimeRecord>()
@@ -4344,8 +4493,12 @@ private func servicePluginRunSupervisorTick(serviceId: String, nowMs: Int64, all
 public func runServicePluginSupervisorTickForTest(serviceId: String, nowMs!: Int64 = servicePluginNowMs()): ServicePluginSupervisorTickResult {
     // Manual supervisor tests own the probe sequence; stop the background worker
     // so fake healthz probes are not consumed by a concurrent tick.
+    let deadlineMs = servicePluginDeadlineNowMs() + servicePluginSupervisorStopTimeoutMs(servicePluginSupervisorConfig)
     servicePluginSupervisorAutoStartForTest = false
     servicePluginStopSupervisorWorker(serviceId.trimAscii())
+    if (!servicePluginAwaitSupervisorsUntil(serviceId.trimAscii(), deadlineMs)) {
+        return ServicePluginSupervisorTickResult(false, "cleanup_pending", diagnostic: "supervisor_cleanup_pending")
+    }
     servicePluginRunSupervisorTick(serviceId, nowMs, allowRecover: true)
 }
 
@@ -4361,6 +4514,7 @@ private func logServicePluginSupervisorTick(serviceId: String, tick: ServicePlug
 
 private func servicePluginRunSupervisorWorkerTick(serviceId: String, nowMs: Int64): Unit {
     let sid = serviceId.trimAscii()
+    servicePluginReapFinishedSupervisors(sid)
     try {
         let tick = servicePluginRunSupervisorTick(sid, nowMs, allowRecover: true)
         logServicePluginSupervisorTick(sid, tick)
@@ -4400,22 +4554,77 @@ private func servicePluginReserveSupervisorLocked(serviceId: String): Option<Ser
                 }
             case None => ()
         }
-        let flag = ServicePluginSupervisorStopFlag()
+        servicePluginSupervisorNextToken++
+        let flag = ServicePluginSupervisorStopFlag(serviceId, servicePluginSupervisorNextToken)
+        servicePluginSupervisorOwned[flag.token] = flag
         servicePluginSupervisorWorkers[serviceId] = flag
         Some(flag)
     }
 }
 
 private func servicePluginSpawnSupervisorWorker(serviceId: String, flag: ServicePluginSupervisorStopFlag): Unit {
-    spawn {
-        while (!flag.stopped()) {
-            sleep(Duration.millisecond * servicePluginSupervisorConfig.intervalMs)
-            if (flag.stopped()) {
-                return
+    let worker = spawn {
+        flag.entered()
+        try {
+            while (flag.waitInterval(servicePluginSupervisorConfig.intervalMs)) {
+                if (!flag.stopped()) { servicePluginRunSupervisorWorkerTick(serviceId, servicePluginNowMs()) }
             }
-            servicePluginRunSupervisorWorkerTick(serviceId, servicePluginNowMs())
+        } finally { flag.finished() }
+    }
+    try {
+        match (servicePluginBeforeSupervisorAttachForTest) { case Some(hook) => hook(serviceId) case None => () }
+    } finally { flag.attach(worker) }
+}
+
+private func servicePluginSupervisorWorkerFailed(serviceId: String): Unit {
+    let meta = JsonObject()
+    meta.put("serviceId", JsonString(serviceId))
+    meta.put("diagnostic", JsonString("supervisor_worker_failed"))
+    try { servicePluginHostLogger.warn(MetisLogEvent.loggingRaw, "service_plugin.supervisor.exception", meta: meta) }
+    catch (_: Exception) { () }
+}
+
+private func servicePluginRetireSupervisor(flag: ServicePluginSupervisorStopFlag): Unit {
+    synchronized(servicePluginSupervisorLock) {
+        match (servicePluginSupervisorOwned.get(flag.token)) {
+            case Some(original) =>
+                if (refEq(original, flag)) { servicePluginSupervisorOwned.remove(flag.token) }
+            case None => ()
+        }
+        match (servicePluginSupervisorWorkers.get(flag.serviceId)) {
+            case Some(current) =>
+                if (refEq(current, flag)) { servicePluginSupervisorWorkers.remove(flag.serviceId) }
+            case None => ()
         }
     }
+}
+
+private func servicePluginSupervisorOwnedSnapshot(serviceId: String): ArrayList<ServicePluginSupervisorStopFlag> {
+    synchronized(servicePluginSupervisorLock) {
+        let flags = ArrayList<ServicePluginSupervisorStopFlag>()
+        for ((_, flag) in servicePluginSupervisorOwned) {
+            if (serviceId.isEmpty() || flag.serviceId == serviceId) { flags.add(flag) }
+        }
+        flags
+    }
+}
+
+private func servicePluginReapFinishedSupervisors(serviceId: String): Unit {
+    for (flag in servicePluginSupervisorOwnedSnapshot(serviceId)) {
+        if (flag.tryJoined()) { servicePluginRetireSupervisor(flag) }
+    }
+}
+
+private func servicePluginAwaitSupervisorsUntil(serviceId: String, deadlineMs: Int64,
+    allowRecoverySelf!: Bool = false): Bool {
+    var complete = true
+    for (flag in servicePluginSupervisorOwnedSnapshot(serviceId)) {
+        if (!flag.stopped()) { continue }
+        if (allowRecoverySelf && flag.isSelf()) { continue }
+        if (flag.tryJoined() || flag.awaitJoined(deadlineMs)) { servicePluginRetireSupervisor(flag) }
+        else { complete = false }
+    }
+    complete
 }
 
 private func servicePluginStartSupervisorWorker(record: ServicePluginRuntimeRecord): Bool {
@@ -4437,23 +4646,11 @@ private func servicePluginStartSupervisorWorker(record: ServicePluginRuntimeReco
 }
 
 private func servicePluginStopSupervisorWorker(serviceId: String): Unit {
-    synchronized(servicePluginSupervisorLock) {
-        match (servicePluginSupervisorWorkers.get(serviceId.trimAscii())) {
-            case Some(flag) =>
-                flag.stop()
-                servicePluginSupervisorWorkers.remove(serviceId.trimAscii())
-            case None => ()
-        }
-    }
+    for (flag in servicePluginSupervisorOwnedSnapshot(serviceId.trimAscii())) { flag.stop() }
 }
 
 private func stopAllServicePluginSupervisors(): Unit {
-    synchronized(servicePluginSupervisorLock) {
-        for ((_, flag) in servicePluginSupervisorWorkers) {
-            flag.stop()
-        }
-        servicePluginSupervisorWorkers = HashMap<String, ServicePluginSupervisorStopFlag>()
-    }
+    for (flag in servicePluginSupervisorOwnedSnapshot("")) { flag.stop() }
 }
 
 private func servicePluginLeaseStartDiagnostic(status: String, lease: ServicePluginLeaseSnapshot, pidAlive: Bool, portOwnerAlive: Bool): String {
@@ -4686,8 +4883,7 @@ public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMilli
             activeIds.add(serviceId)
         }
         synchronized(servicePluginSupervisorLock) {
-            for ((_, flag) in servicePluginSupervisorWorkers) { supervisorFlags.add(flag) }
-            servicePluginSupervisorWorkers = HashMap<String, ServicePluginSupervisorStopFlag>()
+            for ((_, flag) in servicePluginSupervisorOwned) { supervisorFlags.add(flag) }
         }
         for ((serviceId, record) in servicePluginRegistry) {
             if (record.status == "registered" && !servicePluginStartClaims.contains(serviceId) && !servicePluginActiveProcesses.contains(serviceId)) {
@@ -4759,9 +4955,10 @@ public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMilli
             case None => ()
         }
     }
+    let supervisorsJoined = servicePluginAwaitSupervisorsUntil("", deadlineMs)
     synchronized(servicePluginProcessLock) {
         let results = ArrayList<ServiceStopResult>()
-        var allStopped = true
+        var allStopped = supervisorsJoined
         for ((serviceId, record) in servicePluginRegistry) {
             match (stopResults.get(serviceId)) {
                 case Some(result) =>
@@ -5121,6 +5318,7 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
         return ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin start cancelled")
     }
     claim.settle("published", "")
+    servicePluginReapFinishedSupervisors(serviceId)
     if (!servicePluginStartSupervisorWorker(record)) {
         return ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin host is shutting down")
     }
@@ -5839,6 +6037,22 @@ private func servicePluginStopPendingCleanup(sid: String, record: ServicePluginR
 private func servicePluginStopOwned(serviceId: String, reason: String, timeoutMillis: Int64,
     expectedRecord: Option<ServicePluginRuntimeRecord>, expectedInstanceId: String,
     expectedOwner: Option<(String, Int64, Int64)>): ServiceStopResult {
+    let deadlineMs = servicePluginDeadlineNowMs() + max(0, min(timeoutMillis, 30000))
+    let result = servicePluginStopOwnedUntil(serviceId, reason, timeoutMillis,
+        expectedRecord, expectedInstanceId, expectedOwner, deadlineMs)
+    if (result.status == "stale_owner" || result.status == "missing") { return result }
+    let joined = servicePluginAwaitSupervisorsUntil(serviceId.trimAscii(), deadlineMs,
+        allowRecoverySelf: expectedRecord.isSome())
+    if (joined) { return result }
+    ServiceStopResult(false, result.serviceId, "cleanup_pending", stateFlushed: false,
+        diagnostic: "${result.diagnostic} supervisor_cleanup_pending",
+        ingressStopStatus: result.ingressStopStatus, dispatchStatus: result.dispatchStatus,
+        ownerStopStatus: result.ownerStopStatus, leaseStatus: result.leaseStatus, portStatus: result.portStatus)
+}
+
+private func servicePluginStopOwnedUntil(serviceId: String, reason: String, timeoutMillis: Int64,
+    expectedRecord: Option<ServicePluginRuntimeRecord>, expectedInstanceId: String,
+    expectedOwner: Option<(String, Int64, Int64)>, deadlineMs: Int64): ServiceStopResult {
     match (servicePluginRegistry.get(serviceId.trimAscii())) {
         case Some(record) =>
             let sid = serviceId.trimAscii()
@@ -5864,7 +6078,6 @@ private func servicePluginStopOwned(serviceId: String, reason: String, timeoutMi
                 return ServiceStopResult(false, sid, "degraded", diagnostic: record.degradedReason)
             }
             let effectiveTimeoutMillis = min(timeoutMillis, 30000)
-            let deadlineMs = servicePluginDeadlineNowMs() + effectiveTimeoutMillis
             let pendingLookup = synchronized(servicePluginProcessLock) {
                 (servicePluginCleanupPendingForServiceLocked(sid), record.instanceId)
             }

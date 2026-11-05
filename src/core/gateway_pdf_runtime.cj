@@ -1,12 +1,13 @@
 package metis.core
 
+import metis.process.managedRecoveryExecuteWithOutput
+
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisPaths}
 import metis.core.model.{modelVisionSupportIsSupported, resolveModelImageCapability}
 
 import std.collection.ArrayList
 import std.convert.Parsable
 import std.fs.{Directory, File, Path, exists}
-import std.process.executeWithOutput
 import std.time.*
 import stdx.encoding.base64.toBase64String
 import stdx.encoding.json.{JsonArray, JsonBool, JsonFloat, JsonInt, JsonObject, JsonString, JsonValue}
@@ -482,7 +483,7 @@ private func pdfDependencyStatus(packageName: String): JsonObject {
             }
             try {
                 let script = "require.resolve(\"${packageName}\")"
-                let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput("node", ["-e", script], workingDirectory: helperRoot)
+                let (exitCode, stdoutBytes, stderrBytes) = managedRecoveryExecuteWithOutput("node", ["-e", script], workingDirectory: helperRoot)
                 if (exitCode == 0) {
                     out.put("loadable", JsonBool(true))
                     out.put("status", JsonString("loadable"))

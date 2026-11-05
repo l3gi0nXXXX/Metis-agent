@@ -1,9 +1,11 @@
 #!/usr/bin/env node
+import { constants as osConstants } from 'node:os';
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, lstatSync, fstatSync, openSync, writeSync, fsyncSync, fchmodSync, closeSync, unlinkSync, accessSync, constants } from "node:fs";
+import { join, dirname } from "node:path";
 import { TextDecoder } from "node:util";
+import { Writable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const OWNER_HARD_LIMIT = 256;
@@ -16,6 +18,233 @@ const DIAGNOSTIC_IDENTITY_LIMIT = 16;
 const DIAGNOSTIC_FILE_PATTERN = /^broker-g[1-9][0-9]*-p[1-9][0-9]*\.json$/u;
 const DIAGNOSTIC_TEMP_PATTERN = /^broker-g[1-9][0-9]*-p[1-9][0-9]*\.json\.tmp-[1-9][0-9]*$/u;
 const DIAGNOSTIC_SLOT_PATTERN = /^\.identity-slot-(?:[0-9]|1[0-5])$/u;
+
+const recoveryKey = (value) => typeof value === 'string' && /^[A-Za-z0-9_-]{1,256}$/u.test(value);
+
+/** Immutable source facts: a late parent birth observation cannot overwrite a terminal fact. */
+export function publishRecoveryFact(directory, key, phase, parent, pid = 0, pgid = 0) {
+  if (!directory) return;
+  if (!recoveryKey(key) || (!['intent', 'spawned', 'terminal', 'not_spawned'].includes(phase) ||
+      (phase === 'not_spawned' && (pid !== 0 || pgid !== 0))) ||
+      !/^1(?::[0-9]+){11}$/u.test(parent)) throw new Error('recovery_record_invalid');
+  let current = directory;
+  for (;;) {
+    if (lstatSync(current).isSymbolicLink()) throw new Error('recovery_path_unsafe');
+    const next = dirname(current);
+    if (next === current) break;
+    current = next;
+  }
+  const text = `managed-recovery-v1\nkey:${key}\nphase:${phase}\nparent:${parent}\npid:${pid}\npgid:${pgid}\nbirth:\n`;
+  const path = join(directory, `${key}.${phase}`);
+  let fd;
+  try {
+    fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    fchmodSync(fd, 0o600);
+    const bytes = Buffer.from(text);
+    let used = 0;
+    while (used < bytes.length) used += writeSync(fd, bytes, used, bytes.length - used);
+    fsyncSync(fd);
+  } catch (error) {
+    if (error?.code !== 'EEXIST' || lstatSync(path).isSymbolicLink() || readFileSync(path, 'utf8') !== text) throw error;
+  } finally { if (fd !== undefined) closeSync(fd); }
+  const directoryFd = openSync(directory, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+}
+
+/** Internal artifact only: no command PATH or public environment override. */
+function resolveNativeExecGate() {
+  const root = dirname(dirname(fileURLToPath(import.meta.url)));
+  const source = join(root, 'src', 'process', 'managed_exec_gate.c');
+  const development = existsSync(join(root, 'src'));
+  const asset = development ? join(root, 'target', 'native', 'metis-exec-gate-v1') :
+    join(root, 'libexec', 'metis-exec-gate-v1');
+  let current = asset;
+  for (;;) {
+    const info = lstatSync(current);
+    if (info.isSymbolicLink()) throw new Error('exec_gate_asset_invalid');
+    if (current === asset && (!info.isFile() || (info.mode & 0o111) === 0 || (info.mode & 0o022) !== 0)) {
+      throw new Error('exec_gate_asset_invalid');
+    }
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  accessSync(asset, constants.X_OK);
+  if (development) {
+    const built = lstatSync(asset).mtimeMs;
+    for (const input of [source, join(root, 'build.cj')]) {
+      const info = lstatSync(input);
+      if (info.isSymbolicLink() || !info.isFile() || info.mtimeMs > built) throw new Error('exec_gate_asset_stale');
+    }
+  }
+  return asset;
+}
+
+function readRecoverySource(directory, name, limit = 8192) {
+  const path = join(directory, name);
+  const before = lstatSync(path);
+  if (!before.isFile() || before.isSymbolicLink() || before.size > limit) throw new Error('recovery_record_invalid');
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.size > limit) throw new Error('recovery_record_invalid');
+    const bytes = readFileSync(fd);
+    if (bytes.length > limit) throw new Error('recovery_record_invalid');
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } finally { closeSync(fd); }
+}
+
+function recoveryBinding(directory, parent) {
+  const text = readRecoverySource(directory, 'inventory');
+  const prefix = `managed-recovery-v1\nparent:${parent}\nbinding:`;
+  const suffix = '\ncoverage:broker-v1\n';
+  if (!text.startsWith(prefix) || !text.endsWith(suffix)) throw new Error('recovery_record_invalid');
+  const binding = text.slice(prefix.length, -suffix.length);
+  if (!binding || Buffer.byteLength(binding) > 4096 || /[\r\n\0]/u.test(binding)) throw new Error('recovery_record_invalid');
+  return binding;
+}
+
+function originalRecoveryBirth(directory, key, parent, pid, pgid) {
+  let birth = '';
+  for (const phase of ['intent', 'spawned', 'birth']) {
+    const text = readRecoverySource(directory, `${key}.${phase}`);
+    if (phase === 'birth') {
+      const match = /\nbirth:([1-9][0-9]*:[1-9][0-9]*:(?:0|[1-9][0-9]{0,5}))\n$/u.exec(text);
+      if (!match || match[1].split(':')[0] !== String(pid) ||
+          !Number.isSafeInteger(Number(match[1].split(':')[1])) || Number(match[1].split(':')[2]) >= 1000000) {
+        throw new Error('recovery_record_invalid');
+      }
+      birth = match[1];
+    }
+    const expected = `managed-recovery-v1\nkey:${key}\nphase:${phase}\nparent:${parent}\npid:${phase === 'intent' ? 0 : pid}\npgid:${phase === 'intent' ? 0 : pgid}\nbirth:${phase === 'birth' ? birth : ''}\n`;
+    if (text !== expected) throw new Error('recovery_record_invalid');
+  }
+  return birth;
+}
+
+function publishExecError(broker, owner) {
+  let current = broker.recoveryDirectory;
+  for (;;) {
+    const info = lstatSync(current);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('recovery_path_unsafe');
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  if (recoveryBinding(broker.recoveryDirectory, broker.recoveryParent) !== broker.recoveryBinding) {
+    throw new Error('recovery_record_invalid');
+  }
+  const { phase, error } = owner.gateOutcome;
+  const pid = phase === 'spawn' ? 0 : Number(owner.child.pid);
+  const helperBirth = originalRecoveryBirth(broker.recoveryDirectory, broker.recoveryKey, broker.recoveryParent, process.pid, 0);
+  let ownerBirth = '';
+  if (phase === 'spawn') {
+    if (!owner.spawnFailure || owner.spawned || owner.child.pid !== undefined || !owner.closed) {
+      throw new Error('recovery_record_invalid');
+    }
+    const intent = `managed-recovery-v1\nkey:${owner.journalKey}\nphase:intent\nparent:${broker.recoveryParent}\npid:0\npgid:0\nbirth:\n`;
+    if (readRecoverySource(broker.recoveryDirectory, `${owner.journalKey}.intent`) !== intent ||
+        readRecoverySource(broker.recoveryDirectory, `${owner.journalKey}.not_spawned`) !== intent.replace('phase:intent\n', 'phase:not_spawned\n')) {
+      throw new Error('recovery_record_invalid');
+    }
+    const names = readdirSync(broker.recoveryDirectory);
+    if (['spawned', 'birth', 'terminal'].some((name) => names.includes(`${owner.journalKey}.${name}`))) {
+      throw new Error('recovery_record_invalid');
+    }
+  } else ownerBirth = originalRecoveryBirth(broker.recoveryDirectory, owner.journalKey, broker.recoveryParent, pid, pid);
+  const text = `managed-exec-error-v1\nkey:${owner.journalKey}\nparent:${broker.recoveryParent}\nbinding:${broker.recoveryBinding}\nhelper_key:${broker.recoveryKey}\nhelper_pid:${process.pid}\nhelper_birth:${helperBirth}\nowner_pid:${pid}\nowner_pgid:${pid}\nowner_birth:${ownerBirth}\nphase:${phase}\nerrno:${error}\n`;
+  if (owner.execErrorPublished) {
+    if (readRecoverySource(broker.recoveryDirectory, `${owner.journalKey}.exec_error`) !== text) {
+      throw new Error('recovery_record_invalid');
+    }
+    return;
+  }
+  const path = join(broker.recoveryDirectory, `${owner.journalKey}.exec_error`);
+  let fd;
+  try {
+    fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    fchmodSync(fd, 0o600);
+    const bytes = Buffer.from(text);
+    let offset = 0;
+    while (offset < bytes.length) {
+      let count;
+      try { count = writeSync(fd, bytes, offset, bytes.length - offset); }
+      catch (error) { if (error?.code === 'EINTR') continue; throw error; }
+      if (count <= 0) throw new Error('recovery_write_failed');
+      offset += count;
+    }
+    fsyncSync(fd);
+  } finally { if (fd !== undefined) closeSync(fd); }
+  const directoryFd = openSync(broker.recoveryDirectory, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+  owner.execErrorPublished = true;
+}
+
+function recoveryBirthMatches(directory, key, parent, pid, pgid) {
+  try {
+    const path = join(directory, `${key}.birth`);
+    const info = lstatSync(path);
+    if (info.isSymbolicLink() || !info.isFile() || info.size > 8192) return false;
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(path));
+    const lines = text.split('\n');
+    if (lines.shift() !== 'managed-recovery-v1') return false;
+    const fields = new Map();
+    for (const line of lines) {
+      if (!line) continue;
+      const colon = line.indexOf(':');
+      const name = line.slice(0, colon);
+      if (colon < 1 || fields.has(name)) return false;
+      fields.set(name, line.slice(colon + 1));
+    }
+    const birth = fields.get('birth')?.split(':');
+    const seconds = Number(birth?.[1]);
+    const micros = Number(birth?.[2]);
+    return fields.size === 6 && fields.get('key') === key && fields.get('parent') === parent && fields.get('phase') === 'birth' &&
+      fields.get('pid') === String(pid) && fields.get('pgid') === String(pgid) && birth?.length === 3 && birth[0] === String(pid) &&
+      Number.isSafeInteger(seconds) && seconds > 0 && String(seconds) === birth[1] &&
+      Number.isSafeInteger(micros) && micros >= 0 && micros < 1000000 && String(micros) === birth[2];
+  } catch { return false; }
+}
+
+export function mergeClosedSequence(ranges, sequence) {
+  if (!Number.isSafeInteger(sequence) || sequence <= 0) throw new Error('recovery_sequence_invalid');
+  const out = [];
+  let low = sequence, high = sequence, inserted = false;
+  for (const [start, end] of ranges) {
+    if (end + 1 < low) out.push([start, end]);
+    else if (high + 1 < start) { if (!inserted) { out.push([low, high]); inserted = true; } out.push([start, end]); }
+    else { low = Math.min(low, start); high = Math.max(high, end); }
+  }
+  if (!inserted) out.push([low, high]);
+  return out;
+}
+
+export function publishClosedCheckpoint(directory, key, parent, issued, ranges) {
+  if (!recoveryKey(key) || !Number.isSafeInteger(issued) || issued <= 0 || ranges.length > OWNER_HARD_LIMIT + 1) throw new Error('recovery_checkpoint_invalid');
+  let previous = 0;
+  for (const [start, end] of ranges) {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start <= previous || start <= 0 || end < start || end > issued) {
+      throw new Error('recovery_checkpoint_invalid');
+    }
+    previous = end;
+  }
+  const target = join(directory, `${key}.closed`);
+  const temporary = `${target}.tmp-${process.pid}`;
+  const text = `managed-recovery-v1\nparent:${parent}\nbroker:${key}\nissued:${issued}\nranges:${ranges.map(([a, b]) => `${a}-${b}`).join(',')}\n`;
+  let fd;
+  try {
+    fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+    fchmodSync(fd, 0o600);
+    const data = Buffer.from(text);
+    let used = 0;
+    while (used < data.length) used += writeSync(fd, data, used, data.length - used);
+    fsyncSync(fd); closeSync(fd); fd = undefined;
+    if (existsSync(target) && lstatSync(target).isSymbolicLink()) throw new Error('recovery_path_unsafe');
+    renameSync(temporary, target);
+    const directoryFd = openSync(directory, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+  } finally { if (fd !== undefined) closeSync(fd); }
+}
 
 function diagnosticDirectoryState(path) {
   let slotCount = 0;
@@ -146,6 +375,48 @@ export function normalizedOwnerSpawnOptions(frame, platform = process.platform) 
     detached: platform !== 'win32',
     windowsHide: true,
   };
+}
+
+// CoreFoundation may mutate Node's native environment before JavaScript starts.
+// This witness is supplied only by the existing attached Cangjie launcher.
+export function attachedBusinessEnvironment(environment, platform = process.platform) {
+  const result = { ...environment };
+  const marker = 'METIS_STDIO_ATTACHED_CF_ENV_V1';
+  if (platform !== 'darwin' || !Object.hasOwn(environment, marker)) return result;
+  let witness;
+  try { witness = JSON.parse(environment[marker]); }
+  catch { throw new Error('attached_environment_invalid'); }
+  if (!Array.isArray(witness) || witness.length !== 5 || witness[0] !== 1 ||
+      typeof witness[1] !== 'boolean' || typeof witness[3] !== 'boolean' ||
+      typeof witness[2] !== 'string' || typeof witness[4] !== 'string' ||
+      witness[2].includes('\0') || witness[4].includes('\0') ||
+      Buffer.from(witness[2], 'utf8').toString('utf8') !== witness[2] ||
+      Buffer.from(witness[4], 'utf8').toString('utf8') !== witness[4] ||
+      (!witness[1] && witness[2] !== '') || (!witness[3] && witness[4] !== '')) {
+    throw new Error('attached_environment_invalid');
+  }
+  if (witness[1]) result.__CF_USER_TEXT_ENCODING = witness[2];
+  else delete result.__CF_USER_TEXT_ENCODING;
+  if (witness[3]) result[marker] = witness[4];
+  else delete result[marker];
+  return result;
+}
+
+export function recoveryGateShell(environment, platform = process.platform) {
+  const gate = 'IFS= read -r metis_gate <&3 || exit 125; exec 3<&-; ';
+  if (platform !== 'darwin') return { script: `${gate}exec "$@"`, env: environment };
+  // Protected macOS shells strip DYLD_* on entry. Keep values in env, then
+  // restore them after the ownership ACK without inserting values into code.
+  const env = { ...environment };
+  let restore = '', sequence = 0;
+  for (const name of Object.keys(environment)) {
+    if (!/^DYLD_[A-Za-z0-9_]*$/u.test(name)) continue;
+    let shadow;
+    do { shadow = `METIS_GATE_DYLD_${sequence++}`; } while (Object.hasOwn(env, shadow));
+    env[shadow] = environment[name];
+    restore += `${name}="\${${shadow}}"; export ${name}; unset ${shadow}; `;
+  }
+  return { script: `${gate}${restore}exec "$@"`, env };
 }
 
 export function terminationCommandsForPlatform(platform, pid, force = false) {
@@ -361,8 +632,24 @@ export class StdioBroker {
     testMode = process.env.METIS_STDIO_BROKER_TEST_MODE === '1',
     exit = (code) => process.exit(code),
     parentPidProvider = () => process.ppid,
-    diagnosticMarkerDirectory = testMode ? process.env.METIS_STDIO_BROKER_DIAGNOSTIC_MARKER ?? '' : '' } = {}) {
+    attachedStdio = false,
+    diagnosticMarkerDirectory = testMode && !attachedStdio &&
+      (process.env.METIS_TEST_STDIO_BROKER_RECOVERY_DIAGNOSTICS_ONLY !== '1' ||
+        Boolean(process.env.METIS_PROCESS_RECOVERY_DIRECTORY))
+      ? process.env.METIS_STDIO_BROKER_DIAGNOSTIC_MARKER ?? '' : '' } = {}) {
     this.generation = generation;
+    this.attachedStdio = attachedStdio;
+    this.attachedBusinessEnv = attachedStdio ? attachedBusinessEnvironment(process.env, platform) : null;
+    this.recoveryDirectory = process.env.METIS_PROCESS_RECOVERY_DIRECTORY ?? '';
+    this.recoveryParent = process.env.METIS_PROCESS_RECOVERY_PARENT ?? '';
+    this.recoveryKey = process.env.METIS_PROCESS_RECOVERY_BROKER_KEY ?? '';
+    this.recoveryBinding = this.recoveryDirectory ? recoveryBinding(this.recoveryDirectory, this.recoveryParent) : '';
+    this.recoveryPersistenceFailed = false;
+    this.recoveryOwnerSequence = 0;
+    this.recoveryClosedRanges = [];
+    if (this.recoveryDirectory) {
+      publishRecoveryFact(this.recoveryDirectory, this.recoveryKey, 'spawned', this.recoveryParent, process.pid, 0);
+    }
     this.platform = platform;
     this.writer = new BrokerWriter(output, { onFailure: (kind, phase) => this.abortForWriterFailure(kind, phase) });
     this.spawnFn = spawnFn;
@@ -415,6 +702,15 @@ export class StdioBroker {
 
   diagnostic(status, requestId) {
     this.frame('broker.diagnostic', { status, ...(requestId ? { requestId } : {}) });
+  }
+
+  stderrDiagnostic(text, status) {
+    if (this.attachedStdio) {
+      this.diagnosticEvent(status);
+      if (!this.writerFailed) this.diagnostic(status);
+      return;
+    }
+    try { process.stderr.write(text); } catch { /* unavailable */ }
   }
 
   diagnosticEvent(event) {
@@ -484,13 +780,17 @@ export class StdioBroker {
     this.writerFailurePhase = ['owner_terminal', 'broker_closed', 'other'].includes(framePhase) ? framePhase : 'other';
     this.diagnosticEvent('writer_failure');
     for (const owner of [...this.owners.values()]) this.signalTree(owner, true);
-    try { process.stderr.write('metis stdio broker protocol writer failed\n'); } catch { /* unavailable */ }
+    this.stderrDiagnostic('metis stdio broker protocol writer failed\n', 'protocol_writer_failed');
     this.waitForAllTreesGoneThenExit(70);
   }
 
   waitForAllTreesGoneThenExit(code, attempt = 0) {
     const live = [...this.owners.values()].filter((owner) => this.treeAlive(owner));
     if (live.length === 0 || attempt >= 160) {
+      if (live.length === 0) {
+        for (const owner of this.owners.values()) this.publishOwnerTerminal(owner);
+        this.publishBrokerTerminal();
+      }
       this.scheduleExit(code);
       return;
     }
@@ -533,6 +833,23 @@ export class StdioBroker {
       this.startOwner(frame);
     } else if (frame.type === 'owner.write') {
       this.writeOwner(frame);
+    } else if (frame.type === 'owner.recovery-commit') {
+      const owner = this.owners.get(frame.ownerId);
+      if (!this.recoveryDirectory || !owner || owner.requestId !== frame.ownerIncarnation || owner.recoveryCommitted) {
+        this.diagnostic('invalid_control_frame');
+      } else {
+        try {
+          const pid = Number(owner.child.pid);
+          if (!recoveryBirthMatches(this.recoveryDirectory, owner.journalKey, this.recoveryParent, pid,
+            this.platform === 'win32' ? 0 : pid)) throw new Error('recovery_record_invalid');
+          owner.recoveryCommitted = true;
+          if (owner.nativeGate) this.commitNativeGate(owner);
+          else {
+            owner.child.stdio[3].end('commit\n');
+            this.frame('owner.recovery-ready', { ownerId: owner.id, requestId: owner.requestId });
+          }
+        } catch { this.failOwner(owner, 'recovery_write_failed'); }
+      }
     } else if (frame.type === 'owner.stop') {
       if (!safeIdentifier(frame.ownerId) || !safeRequestId(frame.requestId)) this.diagnostic('invalid_control_frame');
       else this.stopOwner(frame.ownerId, normalizeStopReason(frame.reason), frame.requestId);
@@ -555,16 +872,48 @@ export class StdioBroker {
   }
 
   startOwner(frame) {
+    let reservedKey = '';
     try {
       validateStartFrame(frame);
       if (this.closing) throw new Error('broker_closing');
       if (this.owners.has(frame.ownerId)) throw new Error('duplicate_owner');
       if (this.owners.size >= this.hardLimit) throw new Error('broker_capacity_exceeded');
-      const child = this.spawnFn(frame.command, frame.args, normalizedOwnerSpawnOptions(frame, this.platform));
+      const nativeAsset = this.recoveryDirectory && this.platform === 'darwin' ? resolveNativeExecGate() : '';
+      const journalKey = `${this.recoveryKey}-o-${++this.recoveryOwnerSequence}`;
+      if (this.recoveryDirectory) {
+        publishRecoveryFact(this.recoveryDirectory, journalKey, 'intent', this.recoveryParent);
+        reservedKey = journalKey;
+      }
+      const options = normalizedOwnerSpawnOptions(frame, this.platform);
+      const gated = Boolean(this.recoveryDirectory);
+      if (gated && this.platform === 'win32') throw new Error('recovery_platform_unsupported');
+      if (gated) options.stdio.push('pipe');
+      if (this.attachedStdio) {
+        options.stdio = ['inherit', 'inherit', 'inherit', 'pipe'];
+        options.env = { ...this.attachedBusinessEnv };
+      }
+      const gate = gated && !nativeAsset ? recoveryGateShell(options.env, this.platform) : null;
+      if (gate) options.env = gate.env;
+      const child = nativeAsset ? this.spawnFn(nativeAsset, [frame.command, ...(frame.args ?? [])], options) : gated ? this.spawnFn('/bin/sh', ['-c',
+        gate.script, 'metis-process-gate', frame.command, ...(frame.args ?? [])], options) :
+        this.spawnFn(frame.command, frame.args, options);
       const owner = {
         id: frame.ownerId,
         requestId: typeof frame.requestId === 'string' ? frame.requestId : '',
         child,
+        journalKey,
+        journalSequence: this.recoveryOwnerSequence,
+        recoveryCommitted: !gated,
+        nativeGate: Boolean(nativeAsset),
+        nativeAsset,
+        spawnFailure: false,
+        gateBuffer: Buffer.alloc(0),
+        gateChallenge: '',
+        gateAckWritten: false,
+        gateEnded: !nativeAsset,
+        gateOutcome: null,
+        execErrorPublished: false,
+        outcomeWriteFailed: false,
         settled: false,
         closed: false,
         spawned: false,
@@ -597,9 +946,21 @@ export class StdioBroker {
       this.owners.set(owner.id, owner);
       this.ownerStartCounts[owner.diagnosticClass] += 1;
       this.diagnosticEvent('owner_started');
-      child.stdout.on('data', (chunk) => this.consume(owner, owner.stdout, chunk));
-      child.stderr.on('data', (chunk) => this.consume(owner, owner.stderr, chunk));
-      child.once('error', () => this.failOwner(owner, 'spawn_failed'));
+      child.stdout?.on('data', (chunk) => this.consume(owner, owner.stdout, chunk));
+      child.stderr?.on('data', (chunk) => this.consume(owner, owner.stderr, chunk));
+      child.once('error', (error) => {
+        if (owner.nativeGate && !owner.spawned && child.pid === undefined && error instanceof Error &&
+            typeof error.code === 'string' && Object.hasOwn(osConstants.errno, error.code)) {
+          const number = osConstants.errno[error.code];
+          if (Number.isSafeInteger(number) && number > 0 && number <= 2147483647 &&
+              error.errno === -number && error.syscall === `spawn ${owner.nativeAsset}`) {
+            owner.spawnFailure = true;
+            owner.gateOutcome = { phase: 'spawn', error: number };
+            owner.failureStatus = 'spawn_failed';
+          }
+        }
+        this.failOwner(owner, 'spawn_failed');
+      });
       child.once('close', (code, signal) => {
         owner.closed = true;
         this.finishOwner(owner, code, signal);
@@ -607,23 +968,102 @@ export class StdioBroker {
       child.once('spawn', () => {
         if (owner.settled) return;
         owner.spawned = true;
-        if ((frame.stdinMode ?? 'line') === 'closed') child.stdin.end();
+        if (this.attachedStdio) {
+          // The real child now owns its inherited copies. Keeping our unused copies
+          // would hide that child's stdin EPIPE and stdout/stderr EOF from its caller.
+          for (const fd of [0, 1, 2]) {
+            try { closeSync(fd); } catch (error) {
+              if (error?.code !== 'EBADF') { this.failOwner(owner, 'attached_stdio_close_failed'); return; }
+            }
+          }
+        }
+        if ((frame.stdinMode ?? 'line') === 'closed') child.stdin?.end();
         const pid = Number(child.pid ?? 0);
+        try {
+          if (this.recoveryDirectory) publishRecoveryFact(this.recoveryDirectory, owner.journalKey, 'spawned', this.recoveryParent,
+            pid, this.platform === 'win32' ? 0 : pid);
+        } catch { this.failOwner(owner, 'recovery_write_failed'); return; }
         this.frame('owner.started', {
           ownerId: owner.id, requestId: owner.requestId, pid, pgid: this.platform === 'win32' ? 0 : pid,
+          ...(this.recoveryDirectory ? { recoveryKey: owner.journalKey } : {}),
         });
       });
+      if (owner.nativeGate) this.observeNativeGate(owner);
+      else if (gated) child.stdio[3].on('error', () => this.failOwner(owner, 'recovery_gate_failed'));
       if (frame.deadlineMs > 0) {
         owner.timer = setTimeout(() => this.terminateOwner(owner, 'timed_out'), frame.deadlineMs);
         owner.timer.unref?.();
       }
     } catch (error) {
+      // A synchronous factory/setup throw has no libuv no-child receipt.
+      if (reservedKey) {
+        this.recoveryPersistenceFailed = true;
+        const owned = this.owners.get(frame.ownerId);
+        if (owned) this.failOwner(owned, 'exec_outcome_unknown');
+      }
       const status = stableOwnerError(error instanceof Error ? error.message : 'spawn_failed');
       this.frame('owner.error', {
         ownerId: typeof frame?.ownerId === 'string' ? frame.ownerId : '',
         requestId: typeof frame?.requestId === 'string' ? frame.requestId : '', status,
       });
     }
+  }
+
+  commitNativeGate(owner) {
+    if (!owner.recoveryCommitted || !owner.gateChallenge || owner.gateAckWritten || owner.gateOutcome || owner.settled) return;
+    owner.gateAckWritten = true;
+    owner.child.stdio[3].end(`METIS-EXEC-ACK:1:${owner.gateChallenge}\n`, (error) => {
+      if (error) {
+        owner.gateOutcome = { phase: 'channel', error: 0 };
+        this.failOwner(owner, 'exec_outcome_unknown');
+      } else this.frame('owner.recovery-ready', { ownerId: owner.id, requestId: owner.requestId });
+    });
+  }
+
+  isRequestedPreAckStop(owner) {
+    return owner.nativeGate && owner.spawned && !owner.spawnFailure &&
+      ['broker_closed', 'stopped', 'timed_out'].includes(owner.stopReason) &&
+      !owner.recoveryCommitted && !owner.gateAckWritten && !owner.gateOutcome &&
+      owner.gateBuffer.length === 0 && ['', 'timed_out'].includes(owner.failureStatus);
+  }
+
+  observeNativeGate(owner) {
+    const channel = owner.child.stdio[3];
+    const unknown = (transportEnd = false) => {
+      if (owner.spawnFailure || (transportEnd === true && this.isRequestedPreAckStop(owner))) return;
+      owner.gateOutcome = { phase: 'channel', error: 0 };
+      this.failOwner(owner, 'exec_outcome_unknown');
+    };
+    channel.on('data', (chunk) => {
+      if (owner.gateEnded || owner.gateOutcome || chunk.some((byte) => byte > 0x7f || byte === 0)) { unknown(); return; }
+      owner.gateBuffer = Buffer.concat([owner.gateBuffer, chunk]);
+      if (owner.gateBuffer.length > 512) { unknown(); return; }
+      for (;;) {
+        const newline = owner.gateBuffer.indexOf(10);
+        if (newline < 0) break;
+        const line = owner.gateBuffer.subarray(0, newline).toString('ascii');
+        owner.gateBuffer = owner.gateBuffer.subarray(newline + 1);
+        const hello = /^METIS-EXEC-GATE:1:([0-9a-f]{32})$/u.exec(line);
+        if (hello && !owner.gateChallenge) {
+          owner.gateChallenge = hello[1];
+          this.commitNativeGate(owner);
+          continue;
+        }
+        const failed = /^METIS-EXEC-ERROR:1:([0-9a-f]{32}):(exec|setup|protocol):([1-9][0-9]*)$/u.exec(line);
+        if (!failed || failed[1] !== (owner.gateChallenge || '00000000000000000000000000000000') ||
+            (failed[2] === 'exec' && !owner.gateAckWritten) || !Number.isSafeInteger(Number(failed[3])) ||
+            Number(failed[3]) > 2147483647) { unknown(); return; }
+        owner.gateOutcome = { phase: failed[2], error: Number(failed[3]) };
+        if (owner.gateBuffer.length !== 0) { unknown(); return; }
+        break;
+      }
+    });
+    channel.once('end', () => {
+      owner.gateEnded = true;
+      if (owner.gateBuffer.length !== 0 || (!owner.gateOutcome && (!owner.gateChallenge || !owner.gateAckWritten))) unknown(true);
+    });
+    channel.once('error', () => unknown());
+    channel.once('close', () => { if (!owner.gateEnded) { owner.gateEnded = true; unknown(true); } });
   }
 
   consume(owner, framer, chunk) {
@@ -693,6 +1133,18 @@ export class StdioBroker {
 
   finishOwner(owner, code, signal) {
     if (owner.settled) return;
+    if (owner.nativeGate && !owner.gateEnded) {
+      if (!this.isRequestedPreAckStop(owner)) owner.gateOutcome = { phase: 'channel', error: 0 };
+      owner.gateEnded = true;
+    }
+    if (owner.nativeGate && owner.gateOutcome && (owner.spawned || owner.spawnFailure)) {
+      try {
+        if (owner.spawnFailure) publishRecoveryFact(this.recoveryDirectory, owner.journalKey, 'not_spawned', this.recoveryParent);
+        publishExecError(this, owner);
+      }
+      catch { owner.outcomeWriteFailed = true; this.recoveryPersistenceFailed = true; }
+      owner.failureStatus = ['exec', 'spawn'].includes(owner.gateOutcome.phase) && owner.execErrorPublished ? 'spawn_failed' : 'exec_outcome_unknown';
+    }
     try { owner.stdout.finish(); owner.stderr.finish(); }
     catch (error) { owner.failureStatus ||= error instanceof Error ? error.message : 'stream_error'; }
     // The owner is a process group, so a root exit must not leave detached descendants behind.
@@ -763,13 +1215,13 @@ export class StdioBroker {
 
   treeAlive(owner) {
     const pid = Number(owner.child.pid ?? 0);
-    if (pid <= 0) return false;
-    if (this.treeRunner) return this.treeRunner.alive(pid);
+    if (pid <= 0) return Boolean(owner.spawned);
     try {
+      if (this.treeRunner) return this.treeRunner.alive(pid);
       process.kill(this.platform === 'win32' ? pid : -pid, 0);
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      return error?.code !== 'ESRCH';
     }
   }
 
@@ -781,7 +1233,7 @@ export class StdioBroker {
     }
     if (attempt >= 160) {
       // Let the Cangjie client observe broker EOF and perform its independent cached-PGID reap.
-      try { process.stderr.write('metis stdio broker owner reap failed\n'); } catch { /* unavailable */ }
+      this.stderrDiagnostic('metis stdio broker owner reap failed\n', 'owner_reap_failed');
       this.scheduleExit(71);
       return;
     }
@@ -792,12 +1244,14 @@ export class StdioBroker {
 
   settleOwnerOnce(owner, type, fields) {
     if (owner.settled) return;
+    const retainedOutcome = owner.execErrorPublished;
+    this.publishOwnerTerminal(owner, !retainedOutcome);
     owner.settled = true;
     if (owner.timer) clearTimeout(owner.timer);
     if (owner.killTimer) clearTimeout(owner.killTimer);
     if (owner.reapTimer) clearTimeout(owner.reapTimer);
-    owner.child.stdout.removeAllListeners();
-    owner.child.stderr.removeAllListeners();
+    owner.child.stdout?.removeAllListeners();
+    owner.child.stderr?.removeAllListeners();
     owner.child.removeAllListeners();
     try { owner.child.stdin.destroy(); } catch { /* closed */ }
     owner.stdinQueue.length = 0;
@@ -806,7 +1260,9 @@ export class StdioBroker {
     this.ownerTerminalCount += 1;
     this.ownerTerminalCounts[owner.diagnosticClass] += 1;
     this.diagnosticEvent('owner_terminal');
-    this.frame(type, { ownerId: owner.id, ...fields });
+    this.frame(type, { ownerId: owner.id, ...fields }, () => {
+      if (retainedOutcome && !this.attachedStdio) this.publishOwnerTerminal(owner, true);
+    });
     if (this.closing && this.owners.size === 0) this.finishClose();
   }
 
@@ -826,11 +1282,73 @@ export class StdioBroker {
     this.brokerClosedEnqueuedCount += 1;
     this.diagnosticEvent('broker_closed_enqueued');
     this.frame('broker.closed', { ownerCount: 0 }, () => {
+      // Earlier terminal write callbacks finish metadata retirement first.
+      this.publishBrokerTerminal();
       this.closeAckCallbackSeen = true;
       this.brokerClosedCallbackCount += 1;
       this.diagnosticEvent('broker_closed_callback');
       this.writer.whenDrained(() => this.scheduleExit(0));
     });
+  }
+
+  publishOwnerTerminal(owner, compact = !owner.execErrorPublished) {
+    if (!this.recoveryDirectory || owner.outcomeWriteFailed) return;
+    try {
+      const pid = Number(owner.child.pid ?? 0);
+      const closed = this.recoveryClosedRanges.some(([a, b]) => a <= owner.journalSequence && owner.journalSequence <= b);
+      if (!closed) {
+        if (owner.spawned) publishRecoveryFact(this.recoveryDirectory, owner.journalKey, 'terminal', this.recoveryParent,
+          pid, this.platform === 'win32' ? 0 : pid);
+        else if (!owner.closed) return;
+        else publishRecoveryFact(this.recoveryDirectory, owner.journalKey, 'not_spawned', this.recoveryParent);
+        if (!compact) return;
+        if (owner.execErrorPublished) publishExecError(this, owner);
+        const ranges = mergeClosedSequence(this.recoveryClosedRanges, owner.journalSequence);
+        publishClosedCheckpoint(this.recoveryDirectory, this.recoveryKey, this.recoveryParent, this.recoveryOwnerSequence, ranges);
+        this.recoveryClosedRanges = ranges;
+      }
+      if (owner.execErrorPublished) publishExecError(this, owner);
+      this.removeClosedOwnerFacts(owner.journalKey);
+      if (owner.journalSequence % 32 === 0) this.removeCoveredRecoveryResiduals();
+    } catch { this.recoveryPersistenceFailed = true; this.stderrDiagnostic('metis process recovery persistence failed\n', 'recovery_persistence_failed'); }
+  }
+
+  removeClosedOwnerFacts(key) {
+    let errorRemoved = false;
+    const outcome = join(this.recoveryDirectory, `${key}.exec_error`);
+    try {
+      if (!lstatSync(outcome).isFile() || lstatSync(outcome).isSymbolicLink()) throw new Error('recovery_path_unsafe');
+      unlinkSync(outcome); errorRemoved = true;
+    } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    if (errorRemoved) {
+      const fd = openSync(this.recoveryDirectory, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+    }
+    for (const phase of ['intent', 'spawned', 'birth', 'terminal', 'not_spawned']) {
+      const path = join(this.recoveryDirectory, `${key}.${phase}`);
+      try { if (lstatSync(path).isSymbolicLink()) throw new Error('recovery_path_unsafe'); unlinkSync(path); }
+      catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    }
+  }
+
+  removeCoveredRecoveryResiduals() {
+    const prefix = `${this.recoveryKey}-o-`;
+    for (const name of readdirSync(this.recoveryDirectory)) {
+      if (!name.startsWith(prefix)) continue;
+      const match = /^([1-9][0-9]*)\.(intent|spawned|birth|terminal|not_spawned)$/u.exec(name.slice(prefix.length));
+      if (!match) continue;
+      const sequence = Number(match[1]);
+      if (Number.isSafeInteger(sequence) && this.recoveryClosedRanges.some(([a, b]) => a <= sequence && sequence <= b)) {
+        if (readdirSync(this.recoveryDirectory).includes(`${prefix}${sequence}.exec_error`)) continue;
+        this.removeClosedOwnerFacts(`${prefix}${sequence}`);
+      }
+    }
+  }
+
+  publishBrokerTerminal() {
+    if (!this.recoveryDirectory || this.recoveryPersistenceFailed) return;
+    try { publishRecoveryFact(this.recoveryDirectory, this.recoveryKey, 'terminal', this.recoveryParent, process.pid, 0); }
+    catch { this.stderrDiagnostic('metis process recovery persistence failed\n', 'recovery_persistence_failed'); }
   }
 }
 
@@ -838,6 +1356,11 @@ export function runBroker({ input = process.stdin, output = process.stdout,
   generation = Number(process.env.METIS_STDIO_BROKER_GENERATION ?? 1), maxInputBytes = DEFAULT_BROKER_INPUT_BYTES,
   installSignalHandlers = true, exit } = {}) {
   const broker = new StdioBroker({ generation, output, ...(exit ? { exit } : {}) });
+  const owner = helperParentBinding();
+  if (!owner.matches()) { broker.closeBroker(); return broker; }
+  const watcher = setInterval(() => { if (!owner.matches()) broker.closeBroker(); }, 20);
+  watcher.unref();
+  process.once('exit', () => clearInterval(watcher));
   broker.frame('broker.hello', { pid: process.pid, ownerLimit: OWNER_HARD_LIMIT });
   let pending = Buffer.alloc(0);
   const handleLine = (bytes) => {
@@ -883,6 +1406,62 @@ export function runBroker({ input = process.stdin, output = process.stdout,
   return broker;
 }
 
+/** Original parent raw byte/terminal streams; no protocol frame reaches those descriptors. */
+function helperParentBinding() {
+  const declared = process.env.METIS_PROCESS_RECOVERY_OWNER_PID;
+  const birth = process.env.METIS_PROCESS_RECOVERY_OWNER_BIRTH;
+  const expected = declared === undefined ? process.ppid : Number(declared);
+  const valid = Number.isSafeInteger(expected) && expected > 1 &&
+    (declared === undefined || (String(expected) === declared &&
+      typeof birth === 'string' && new RegExp(`^${expected}:[1-9][0-9]*:(?:0|[1-9][0-9]{0,5})$`, 'u').test(birth)));
+  return { matches: () => valid && process.ppid === expected };
+}
+
+export function runAttachedBroker(command, args) {
+  if (!process.env.METIS_PROCESS_RECOVERY_DIRECTORY || !command) throw new Error('recovery_context_missing');
+  let broker;
+  let resultCode = 125;
+  let ownerStarted = false;
+  let pendingOwner = false;
+  const sink = new Writable({ write(chunk, _encoding, done) {
+    // Consume one bounded broker frame immediately; never retain output or decode business bytes.
+    try {
+      const frame = JSON.parse(String(chunk));
+      if (frame.type === 'owner.started') pendingOwner = true;
+      if (['owner.exit', 'owner.error', 'owner.timeout'].includes(frame.type)) {
+        const signalCode = typeof frame.signal === 'string' ? osConstants.signals[frame.signal] : undefined;
+        resultCode = Number.isSafeInteger(frame.exitCode) && frame.exitCode >= 0 && frame.exitCode <= 255
+          ? frame.exitCode : Number.isSafeInteger(signalCode) ? signalCode : 125;
+        broker.closeBroker();
+      }
+    } catch { /* the private protocol sink has no business output */ }
+    done();
+  }});
+  broker = new StdioBroker({ generation: 1, output: sink, attachedStdio: true,
+    exit: (code) => process.exit(code === 0 ? resultCode : code) });
+  const owner = helperParentBinding();
+  if (!owner.matches()) { broker.closeBroker(); return broker; }
+  const hasBirth = (key, pid, pgid) => recoveryBirthMatches(broker.recoveryDirectory, key, broker.recoveryParent, pid, pgid);
+  const watcher = setInterval(() => {
+    if (!owner.matches()) { broker.closeBroker(); return; }
+    if (broker.closing) return;
+    if (!ownerStarted && hasBirth(broker.recoveryKey, process.pid, 0)) {
+      ownerStarted = true;
+      broker.startOwner({ type: 'owner.start', ownerId: 'attached', requestId: 'attached-start', command, args });
+    }
+    const childPid = Number(broker.owners.get('attached')?.child.pid ?? 0);
+    if (pendingOwner && hasBirth(`${broker.recoveryKey}-o-1`, childPid, childPid)) {
+      pendingOwner = false;
+      broker.handle({ type: 'owner.recovery-commit', ownerId: 'attached', ownerIncarnation: 'attached-start' });
+    }
+  }, 20);
+  process.once('SIGTERM', () => broker.closeBroker());
+  process.once('SIGINT', () => broker.closeBroker());
+  process.once('exit', () => clearInterval(watcher));
+  return broker;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  runBroker();
+  if (process.argv[2] === '--attached') runAttachedBroker(process.argv[3], process.argv.slice(4));
+  else runBroker();
 }

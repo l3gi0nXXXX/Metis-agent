@@ -199,10 +199,20 @@ test('HB-BR-P3 proxy forwards broker.closed and exits after serialized stdout dr
 test('H-HB-FIXTURE-01 proxy hold is opt-in, complete, and releases exactly once', async () => {
   const root = mkdtempSync(join(tmpdir(), 'metis-s5-proxy-hold-'));
   const innerBroker = join(root, 'inner-broker.mjs');
+  // Logical writer-close mock: use the same-PID runBroker stream/callback interface.
   writeFileSync(innerBroker, `
-process.stdout.write(JSON.stringify({type:'broker.hello',generation:29,pid:process.pid})+'\\n');
-process.stdin.resume();
-process.stdin.on('close',()=>{process.stdout.write(JSON.stringify({type:'broker.closed',generation:29})+'\\n',()=>process.exit(1));});
+export function runBroker({ input, output, exit }) {
+  let closed = false;
+  const closeBroker = () => {
+    if (closed) return;
+    closed = true;
+    output.write(JSON.stringify({type:'broker.closed',generation:29})+'\\n',()=>exit(1));
+  };
+  input.once('error', closeBroker);
+  input.once('end', closeBroker);
+  output.write(JSON.stringify({type:'broker.hello',generation:29,pid:process.pid})+'\\n');
+  return { closeBroker };
+}
 `);
   const writerEnvironment = (prefix) => ({
     METIS_STDIO_BROKER_GENERATION: '29',
@@ -683,8 +693,13 @@ test('HB-BR-P2 terminal owner is removed before acknowledged two-second broker c
 
 test('P1-B1 validates owner specs, hard limit 255/256/257, and writer drain backpressure', () => {
   assert.equal(validateStartFrame(validStart()), true);
+  assert.equal(validateStartFrame(validStart('env-values', {
+    env: { ['k'.repeat(256)]: '', '中文😀': '合成值\nquoted' },
+  })), true);
   for (const patch of [{ command: '' }, { command: 'x\0y' }, { args: ['x\0y'] }, { requestId: 'bad\nrequest' },
-    { env: { 'bad\nkey': 'value' } }, { maxLineBytes: -1 }, { stdinMode: 'bad' }]) {
+    { env: { 'bad\nkey': 'value' } }, { env: { '': 'value' } }, { env: { 'bad\0key': 'value' } },
+    { env: { 'bad=key': 'value' } }, { env: { 'bad\u0001key': 'value' } }, { env: { 'bad\u007fkey': 'value' } },
+    { env: { ['k'.repeat(257)]: 'value' } }, { maxLineBytes: -1 }, { stdinMode: 'bad' }]) {
     assert.throws(() => validateStartFrame(validStart('bad', patch)), /invalid_owner_spec/);
   }
   const output = new CollectingWritable();
@@ -922,4 +937,139 @@ test('P1-N3 test hang is gated and broker stdin has an exact raw byte cap', asyn
   assert.equal(privateOutput.frames().at(-1).status, 'spawn_failed');
   assert.equal(privateOutput.text.includes('TEST_SECRET'), false);
   assert.equal(privateOutput.text.includes('/Users/private/work'), false);
+});
+
+
+test('R-S1-N1 unknown tree probes cannot claim terminal and attached diagnostics avoid fd2', () => {
+  for (const code of ['ESRCH', 'EPERM', 'EINVAL', undefined]) {
+    const output = new CollectingWritable();
+    const broker = new StdioBroker({ output, treeRunner: {
+      alive: () => { const error = new Error('fixture'); error.code = code; throw error; }, terminate: () => {},
+    }, exit: () => {} });
+    const owner = { id: 'unknown-probe', child: { pid: 543210 }, spawned: true, closed: true, settled: false };
+    assert.equal(broker.treeAlive(owner), code !== 'ESRCH');
+    if (code !== 'ESRCH') {
+      broker.settleAfterTreeGone(owner, 'owner.exit', { exitCode: 0 });
+      assert.equal(owner.settled, false);
+      assert.equal(output.frames().some(frame => frame.type === 'owner.exit'), false);
+      clearTimeout(owner.reapTimer);
+    }
+    broker.writer.close();
+  }
+  const output = new CollectingWritable();
+  const broker = new StdioBroker({ output, attachedStdio: true, exit: () => {} });
+  const original = process.stderr.write;
+  let writes = 0;
+  process.stderr.write = () => { writes += 1; return true; };
+  try {
+    broker.stderrDiagnostic('fixed diagnostic\n', 'recovery_persistence_failed');
+    assert.equal(writes, 0);
+    assert.equal(output.frames().at(-1).status, 'recovery_persistence_failed');
+    broker.attachedStdio = false;
+    broker.stderrDiagnostic('fixed diagnostic\n', 'recovery_persistence_failed');
+    assert.equal(writes, 1);
+  } finally { process.stderr.write = original; broker.writer.close(); }
+});
+
+
+test('F5 diagnostic defaults separate pre-serve, attached and current framed roles without suppressing recovery facts', async () => {
+  const { realpathSync } = await import('node:fs');
+  const { publishRecoveryFact } = await import('./metis-stdio-broker.mjs');
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'metis-hb-role-'));
+  const diagnostics = join(home, 'diagnostics'), inventory = join(home, 'inventory');
+  mkdirSync(diagnostics); mkdirSync(inventory);
+  const keys = ['METIS_STDIO_BROKER_TEST_MODE', 'METIS_STDIO_BROKER_DIAGNOSTIC_MARKER',
+    'METIS_TEST_STDIO_BROKER_RECOVERY_DIAGNOSTICS_ONLY', 'METIS_PROCESS_RECOVERY_DIRECTORY',
+    'METIS_PROCESS_RECOVERY_PARENT', 'METIS_PROCESS_RECOVERY_BROKER_KEY'];
+  const prior = new Map(keys.map(key => [key, process.env[key]]));
+  const parent = '1:99999:0:0:0:0:0:99999:0:1:1:0';
+  const brokers = [];
+  let formal = false, failure;
+  const construct = (generation, extra = {}) => {
+    const broker = new StdioBroker({ generation, output: new CollectingWritable(),
+      testMode: true, treeRunner: fakeTreeRunner(), exit: () => {}, ...extra });
+    brokers.push(broker); return broker;
+  };
+  try {
+    process.env.METIS_STDIO_BROKER_TEST_MODE = '1';
+    process.env.METIS_STDIO_BROKER_DIAGNOSTIC_MARKER = diagnostics;
+    process.env.METIS_TEST_STDIO_BROKER_RECOVERY_DIAGNOSTICS_ONLY = '1';
+    delete process.env.METIS_PROCESS_RECOVERY_DIRECTORY;
+    delete process.env.METIS_PROCESS_RECOVERY_PARENT;
+    delete process.env.METIS_PROCESS_RECOVERY_BROKER_KEY;
+    construct(1); // Pre-serve framed probe: deliberately outside the new inventory.
+    assert.equal(readdirSync(diagnostics).length, 0);
+    writeFileSync(join(inventory, 'inventory'),
+      `managed-recovery-v1\nparent:${parent}\nbinding:diagnostic-role-fixture\ncoverage:broker-v1\n`, { mode: 0o600 });
+    process.env.METIS_PROCESS_RECOVERY_DIRECTORY = inventory;
+    process.env.METIS_PROCESS_RECOVERY_PARENT = parent;
+    process.env.METIS_PROCESS_RECOVERY_BROKER_KEY = 'r-attached';
+    publishRecoveryFact(inventory, 'r-attached', 'intent', parent);
+    construct(1, { attachedStdio: true });
+    assert.equal(existsSync(join(inventory, 'r-attached.spawned')), true);
+    assert.equal(readdirSync(diagnostics).length, 0);
+    process.env.METIS_PROCESS_RECOVERY_BROKER_KEY = 'r-framed';
+    publishRecoveryFact(inventory, 'r-framed', 'intent', parent);
+    construct(2);
+    assert.equal(existsSync(join(inventory, 'r-framed.spawned')), true);
+    assert.deepEqual(readdirSync(diagnostics).sort(), ['.identity-slot-0', `broker-g2-p${process.pid}.json`].sort());
+    assert.equal(existsSync(join(diagnostics, 'overflow.json')), false);
+    // Explicit constructor diagnostics retain their existing unit-fixture meaning.
+    delete process.env.METIS_PROCESS_RECOVERY_DIRECTORY;
+    delete process.env.METIS_PROCESS_RECOVERY_PARENT;
+    delete process.env.METIS_PROCESS_RECOVERY_BROKER_KEY;
+    const explicit = join(home, 'explicit'); mkdirSync(explicit);
+    construct(3, { diagnosticMarkerDirectory: explicit });
+    assert.equal(existsSync(join(explicit, `broker-g3-p${process.pid}.json`)), true);
+    for (const broker of brokers) broker.closeBroker();
+    await waitFor(() => brokers.every(broker => broker.closeFinished) &&
+      existsSync(join(inventory, 'r-attached.terminal')) && existsSync(join(inventory, 'r-framed.terminal')));
+    assert.equal(existsSync(join(inventory, 'r-attached.terminal')), true);
+    assert.equal(existsSync(join(inventory, 'r-framed.terminal')), true);
+    formal = true;
+  } catch (error) { failure = error; } finally {
+    const beforeFallback = { schema: 'metis-framed-diagnostic-roles-v1', formal, roles: [], sources: {}, diagnosticBasenames: [] };
+    try {
+      try {
+        beforeFallback.roles = brokers.map((broker, index) => ({
+          role: ['pre-serve', 'attached', 'framed', 'explicit'][index] ?? 'unexpected',
+          generation: broker.generation, attached: broker.attachedStdio,
+          contextPresent: Boolean(broker.recoveryDirectory), markerEnabled: Boolean(broker.diagnosticMarkerPath),
+          ownerCount: broker.owners.size, closing: broker.closing, closeFinished: broker.closeFinished,
+          closeAckObserved: broker.closeAckCallbackSeen,
+        }));
+      } catch (error) { failure ??= error; }
+      try { beforeFallback.diagnosticBasenames = readdirSync(diagnostics).sort(); }
+      catch (error) { failure ??= error; }
+      for (const name of ['inventory', 'r-attached.intent', 'r-attached.spawned', 'r-attached.terminal',
+        'r-framed.intent', 'r-framed.spawned', 'r-framed.terminal']) {
+        try {
+          const path = join(inventory, name);
+          if (!existsSync(path)) { beforeFallback.sources[name] = { present: false }; continue; }
+          const bytes = readFileSync(path);
+          assert(bytes.length <= 16384, 'diagnostic_role_source_too_large');
+          beforeFallback.sources[name] = { present: true, size: bytes.length, bytesBase64: bytes.toString('base64') };
+        } catch (error) { failure ??= error; }
+      }
+      try { writeFileSync(join(home, 'formal-before-fallback.json'), JSON.stringify(beforeFallback), { mode: 0o600 }); }
+      catch (error) { failure ??= error; }
+    } finally {
+      try {
+        for (const broker of brokers) { try { broker.closeBroker(); } catch (error) { failure ??= error; } }
+        try { await waitFor(() => brokers.every(broker => broker.closeFinished)); }
+        catch (error) { failure ??= error; }
+      } finally {
+        for (const key of keys) {
+          try { const value = prior.get(key); if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+          catch (error) { failure ??= error; }
+        }
+      }
+    }
+    try { writeFileSync(join(home, 'cleanup-receipt.json'), JSON.stringify({ schema: 'metis-framed-diagnostic-cleanup-v1',
+      allRecordedBrokersClosed: brokers.every(broker => broker.closeFinished),
+      priorEnvironmentRestored: keys.every(key => process.env[key] === prior.get(key)) }), { mode: 0o600 }); }
+    catch (error) { failure ??= error; }
+    if (formal && !failure) rmSync(home, { recursive: true, force: true });
+  }
+  if (failure) throw failure;
 });

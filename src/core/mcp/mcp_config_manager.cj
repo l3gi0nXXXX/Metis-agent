@@ -75,8 +75,13 @@ public class MCPConfigManager {
     public func loadMCPServers(): Array<Tool> {
         let tools = ArrayList<Tool>()
 
-        for ((serverName, config) in this.mcpServers) {
-            tools.add(all: this.loadMCPServer(serverName, config))
+        try {
+            for ((serverName, config) in this.mcpServers) {
+                tools.add(all: this.loadMCPServer(serverName, config))
+            }
+        } catch (error: Exception) {
+            let _ = this.close()
+            throw error
         }
 
         return tools.toArray()
@@ -105,14 +110,26 @@ public class MCPConfigManager {
                 HttpMCPClient(initParam.url, headers: initParam.header.toArray())
         }
 
+        // Keep the returned client before any tool/protocol setup can throw.
+        this.mcpClients[serverName] = client
         let tools = ArrayList<Tool>()
         for (tool in client.tools) {
             tools.add(MCPToolWrapper(serverName, tool))
         }
-        this.mcpClients[serverName] = client
         LogUtils.info("Successfully loaded MCP server: ${serverName}")
 
         return tools.toArray()
+    }
+
+    public func close(): Bool {
+        var settled = true
+        for ((name, client) in this.mcpClients.toArray()) {
+            if (let Some(stdio) <- (client as StdioMCPClient)) {
+                try { stdio.close(); this.mcpClients.remove(name) }
+                catch (_: Exception) { settled = false }
+            }
+        }
+        settled
     }
 
     public func showLoadedMCPTools(agent: Agent): Unit {

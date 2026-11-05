@@ -1,7 +1,8 @@
 package metis.core
 
+import metis.process.managedRecoveryExecuteWithOutput
+
 import std.convert.*
-import std.process.executeWithOutput
 
 public interface GatewaySystemProxyReader {
     func readSystemProxy(): String
@@ -20,7 +21,7 @@ public class GatewayScutilSystemProxyReader <: GatewaySystemProxyReader {
 
     public func readSystemProxy(): String {
         try {
-            let (exitCode, stdoutBytes, _) = executeWithOutput("scutil", ["--proxy"])
+            let (exitCode, stdoutBytes, _) = managedRecoveryExecuteWithOutput("scutil", ["--proxy"])
             if (exitCode != 0) {
                 return ""
             }

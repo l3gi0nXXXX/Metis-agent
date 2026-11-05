@@ -1,8 +1,9 @@
 package metis.process
 
 import std.collection.ArrayList
-import std.env.{getVariable, setVariable}
-import std.fs.{File, Path, exists, remove}
+import std.env.{getVariable, removeVariable, setVariable}
+import std.fs.{Directory, File, Path, SymbolicLink, canonicalize, exists, remove}
+import std.posix.chmod
 import std.sync.*
 import std.time.DateTime
 import std.unittest.testmacro.*
@@ -277,6 +278,24 @@ private func managedStdioWriteCloseFixture(path: Path, mode: String, markerPath!
     ).toArray())
 }
 
+@When[os == "macOS"]
+private func brokerArtifactCheck(ok: Bool): Unit {
+    @Expect(ok, true)
+    if (!ok) { throw Exception("internal_artifact_contract_failed") }
+}
+
+@When[os == "macOS"]
+private func brokerArtifactClient(root: Path): ManagedStdioBrokerClient {
+    ManagedStdioBrokerClient(brokerScriptPath: root.join("scripts/metis-stdio-broker.mjs").toString())
+}
+
+@When[os == "macOS"]
+private func brokerArtifactNeverStarted(client: ManagedStdioBrokerClient): Bool {
+    let state = client.snapshot()
+    state.generation == 0 && !state.running && state.brokerPid == 0 && state.ownerCount == 0 &&
+        state.readerCount == 0 && state.dispatcherCount == 0
+}
+
 @Test
 public class ManagedStdioBrokerTest {
     @TestCase
@@ -298,7 +317,12 @@ public class ManagedStdioBrokerTest {
                 @Expect(result.externalTerminal, mode == "nonzero")
                 @Expect(result.terminalBasis, if (mode == "nonzero") { "closed_ack_exit_observed" } else { "unknown" })
                 if (mode == "nonzero") { @Expect(result.status, "broker_close_exit_nonzero") }
-                @Expect(managedStdioBrokerFullySettled(client, 3000), true)
+                let fullySettled = managedStdioBrokerFullySettled(client, 3000)
+                if (!fullySettled) {
+                    let snapshot = client.snapshot()
+                    println("broker_close_formal mode=${mode} running=${snapshot.running} reader=${snapshot.readerCount} dispatcher=${snapshot.dispatcherCount} status=${snapshot.status}")
+                }
+                @Expect(fullySettled, true)
                 let cached = client.close(timeoutMs: 100)
                 @Expect(cached.status, result.status)
                 @Expect(cached.externalTerminal, result.externalTerminal)
@@ -1565,6 +1589,99 @@ public class ManagedStdioBrokerTest {
             gate.release()
             managedStdioJoinFuture(delayedProbe, 2000)
             let _ = client.close(timeoutMs: 3000)
+        }
+    }
+}
+
+@When[os == "macOS"]
+@Test
+public class ManagedStdioInternalArtifactTest {
+
+    @TestCase
+    public func procArtU1CachedClientIgnoresGlobalInvalidAndNeverStarts(): Unit {
+        let home = canonicalize(Directory.createTemp("/private/tmp"))
+        let previous = getVariable("METIS_STDIO_BROKER_SCRIPT")
+        let baseline = ownedTestFdCount()
+        var formal = false
+        try {
+            let script = home.join("broker 中文😀.mjs")
+            File.writeTo(script, "not executed 中文😀".toArray())
+            let client = ManagedStdioBrokerClient(brokerScriptPath: script.toString())
+            setVariable("METIS_STDIO_BROKER_SCRIPT", home.join("missing").toString())
+            brokerArtifactCheck(client.validateInternalArtifacts())
+            brokerArtifactCheck(brokerArtifactNeverStarted(client) && !exists(home.join(".issued")))
+            brokerArtifactCheck(ownedTestFdCount() == baseline)
+            formal = true
+        } finally {
+            match (previous) { case Some(value) => setVariable("METIS_STDIO_BROKER_SCRIPT", value) case None => removeVariable("METIS_STDIO_BROKER_SCRIPT") }
+            File.writeTo(home.join("formal-before-cleanup"), ("formal:${formal}\nno_process:true\n").toArray())
+            if (formal) { remove(home, recursive: true) }
+        }
+    }
+
+    @TestCase
+    public func procArtB1DarwinGateMetadataMatchesProducerRules(): Unit {
+        let home = canonicalize(Directory.createTemp("/private/tmp"))
+        let baseline = ownedTestFdCount()
+        var formal = false
+        try {
+            let root = home.join("安装 中文😀")
+            Directory.create(root.join("scripts"), recursive: true)
+            Directory.create(root.join("libexec"))
+            let script = root.join("scripts/metis-stdio-broker.mjs")
+            let gate = root.join("libexec/metis-exec-gate-v1")
+            let client = brokerArtifactClient(root)
+            brokerArtifactCheck(!client.validateInternalArtifacts())
+            Directory.create(script)
+            brokerArtifactCheck(!client.validateInternalArtifacts())
+            remove(script)
+            let realScript = root.join("scripts/actual.mjs")
+            File.writeTo(realScript, "unused 中文😀".toArray())
+            SymbolicLink.create(script, to: realScript)
+            brokerArtifactCheck(client.validateInternalArtifacts())
+            brokerArtifactCheck(!client.validateInternalArtifacts(requireNativeGate: true))
+            File.writeTo(gate, [0xffu8, 0xfeu8, 0u8])
+            brokerArtifactCheck(unsafe { chmod(gate.toString(), 0o755) } == 0)
+            brokerArtifactCheck(client.validateInternalArtifacts(requireNativeGate: true))
+            brokerArtifactCheck(unsafe { chmod(gate.toString(), 0o775) } == 0)
+            brokerArtifactCheck(!client.validateInternalArtifacts(requireNativeGate: true))
+            brokerArtifactCheck(unsafe { chmod(gate.toString(), 0o644) } == 0)
+            brokerArtifactCheck(!client.validateInternalArtifacts(requireNativeGate: true))
+            remove(gate); Directory.create(gate)
+            brokerArtifactCheck(!client.validateInternalArtifacts(requireNativeGate: true))
+            remove(gate)
+            let actualGate = root.join("actual-gate")
+            File.writeTo(actualGate, [0xffu8, 0xfeu8, 0u8])
+            brokerArtifactCheck(unsafe { chmod(actualGate.toString(), 0o755) } == 0)
+            SymbolicLink.create(gate, to: actualGate)
+            brokerArtifactCheck(!client.validateInternalArtifacts(requireNativeGate: true))
+            remove(gate); remove(root.join("libexec"))
+            let linked = root.join("linked")
+            Directory.create(linked); File.writeTo(linked.join("metis-exec-gate-v1"), [0u8])
+            brokerArtifactCheck(unsafe { chmod(linked.join("metis-exec-gate-v1").toString(), 0o755) } == 0)
+            SymbolicLink.create(root.join("libexec"), to: linked)
+            brokerArtifactCheck(!client.validateInternalArtifacts(requireNativeGate: true))
+            remove(root.join("libexec"))
+            Directory.create(root.join("src/process"), recursive: true)
+            Directory.create(root.join("target/native"), recursive: true)
+            let input = root.join("src/process/managed_exec_gate.c")
+            File.writeTo(input, "source".toArray()); File.writeTo(root.join("build.cj"), "build".toArray())
+            let devGate = root.join("target/native/metis-exec-gate-v1")
+            File.writeTo(devGate, [0u8])
+            brokerArtifactCheck(unsafe { chmod(devGate.toString(), 0o755) } == 0)
+            brokerArtifactCheck(client.validateInternalArtifacts(requireNativeGate: true))
+            // Deliberately create a newer source; this is input construction, not a settle delay.
+            let written = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            while (DateTime.now().toUnixTimeStamp().toMilliseconds() <= written) { () }
+            File.writeTo(input, "new source 中文😀".toArray())
+            brokerArtifactCheck(!client.validateInternalArtifacts(requireNativeGate: true))
+            remove(input); SymbolicLink.create(input, to: realScript)
+            brokerArtifactCheck(!client.validateInternalArtifacts(requireNativeGate: true))
+            brokerArtifactCheck(brokerArtifactNeverStarted(client) && ownedTestFdCount() == baseline)
+            formal = true
+        } finally {
+            File.writeTo(home.join("formal-before-cleanup"), ("formal:${formal}\nno_process:true\n").toArray())
+            if (formal) { remove(home, recursive: true) }
         }
     }
 }

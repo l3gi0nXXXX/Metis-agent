@@ -2,7 +2,7 @@ package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager, GatewayServicePluginUserSettings, MetisConfigManager, MetisProcessEnvironmentLock, cliProviderApiKeyEnvAliases, cliProviderBaseUrlEnvAliases}
 import metis.gateway.process.{gatewayStdioBrokerReady, gatewayStdioBrokerSnapshot}
-import metis.gateway.service_plugin.loadServicePluginManifest
+import metis.gateway.service_plugin.{loadServicePluginManifest, probeServicePluginHistoricalResources}
 import metis.gateway.core.GatewayStopResult
 import metis.gateway.channels.qq.QQAdapter
 import metis.gateway.channels.telegram.TelegramTransport
@@ -11,16 +11,16 @@ import magic.utils.http.HttpUtils
 import magic.config.Config
 import magic.jsonable.*
 import metis.gateway.logging.gatewayLoggingResetForTest
-import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, managedStdioBroker, managedStdioResolveBrokerScriptPath, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, resetManagedStdioBrokerForTest, shutdownManagedStdioBroker, signalProcessInstance}
-import metis.utils.{InfoUtils, ShellTimeoutException}
+import metis.process.{managedRecoveryDirectorySafe, managedRecoveryReadText, managedRecoveryParseFields, managedRecoverySafeKey, observeProcessBirthIdentity, ManagedStdioBrokerClient, ProcessInstanceIdentity, currentProcessInstanceIdentity, managedStdioBroker, managedStdioResolveBrokerScriptPath, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, resetManagedStdioBrokerForTest, shutdownManagedStdioBroker, signalProcessInstance}
+import metis.utils.{InfoUtils, ShellTimeoutException, debugSetShellBrokerProviderForTest}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.core.Duration
 import std.env.{getProcessId, getVariable, removeVariable, setVariable}
-import std.fs.{Directory, File, FileInfo, OpenMode, Path, SymbolicLink, exists, remove}
+import std.fs.{Directory, File, FileInfo, OpenMode, Path, SymbolicLink, canonicalize, exists, remove}
 import std.net.*
 import std.process.{ProcessRedirect, SubProcess, executeWithOutput, launch}
-import std.sync.AtomicInt64
+import std.sync.{AtomicBool, AtomicInt64}
 import std.time.{DateTime, MonoTime}
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
@@ -323,18 +323,72 @@ private func gatewayServeStopMatchingPids(commandNeedle: String): Array<Int64> {
     pids.toArray()
 }
 
+// The readyz snapshot comes from the framed client's actual hello/handle. A
+// matching script name alone also finds raw attached helpers and pre-serve probes.
+private func gatewayServeStopFramedBrokerPid(gatewayPid: Int64, brokerScript: Path, readyzUrl: String): Int64 {
+    let ready = GatewayServeStopLiveOwnerProof()
+    ready.refresh(readyzUrl)
+    if (ready.httpStatus != 200 || !ready.running || ready.brokerPid <= 1 || ready.brokerGeneration <= 0) { return 0 }
+    let pid = ready.brokerPid
+    try {
+        let identity = gatewayReadServeIdentity().getOrThrow()
+        let parent = identity.processIdentity.getOrThrow()
+        let parentBirth = observeProcessBirthIdentity(gatewayPid).getOrThrow()
+        if (identity.pid != gatewayPid || parent.pid != gatewayPid || parent.platform != 1 ||
+            parent.value8 != parentBirth.seconds || parent.value9 != parentBirth.microseconds) { return 0 }
+        let directory = gatewayRecoveryInventoryPath(identity)
+        if (!managedRecoveryDirectorySafe(directory)) { return 0 }
+        let expectedHeader = "managed-recovery-v1\nparent:${parent.serialize()}\nbinding:${identity.nonce}\ncoverage:broker-v1\n"
+        if (managedRecoveryReadText(directory.join("inventory")).getOrThrow() != expectedHeader) { return 0 }
+        let command = executeWithOutput("/bin/ps", ["-o", "command=", "-p", "${pid}"])
+        if (command[0] != 0) { return 0 }
+        let commandText = String.fromUtf8(command[1]).trimAscii()
+        if (!commandText.contains(brokerScript.toString()) || commandText.contains("--attached") ||
+            gatewayServeStopParentPid(pid) != gatewayPid) { return 0 }
+        let before = observeProcessBirthIdentity(pid).getOrThrow().serialize()
+        var matched: Int64 = 0
+        var scanned: Int64 = 0
+        for (entry in Directory.readFrom(directory)) {
+            scanned += 1
+            if (scanned > 4096) { return 0 }
+            let nameParts = entry.name.split(".")
+            if (nameParts.size != 2 || nameParts[1] != "birth" || !managedRecoverySafeKey(nameParts[0]) ||
+                nameParts[0].contains("-o-")) { continue }
+            let key = nameParts[0]
+            let original = managedRecoveryReadText(entry.path).getOrThrow()
+            let fields = managedRecoveryParseFields(original).getOrThrow()
+            if (fields.get("pid").getOrDefault({ => "" }) != "${pid}") { continue }
+            let expected = "managed-recovery-v1\nkey:${key}\nphase:birth\nparent:${parent.serialize()}\npid:${pid}\npgid:0\nbirth:${before}\n"
+            if (original != expected ||
+                managedRecoveryReadText(directory.join("${key}.spawned")).getOrThrow() !=
+                    expected.replace("phase:birth\n", "phase:spawned\n").replace("birth:${before}\n", "birth:\n") ||
+                managedRecoveryReadText(directory.join("${key}.intent")).getOrThrow() !=
+                    "managed-recovery-v1\nkey:${key}\nphase:intent\nparent:${parent.serialize()}\npid:0\npgid:0\nbirth:\n" ||
+                exists(directory.join("${key}.terminal"))) { return 0 }
+            matched += 1
+        }
+        if (matched != 1 || observeProcessBirthIdentity(pid).getOrThrow().serialize() != before ||
+            observeProcessBirthIdentity(gatewayPid).getOrThrow().serialize() != parentBirth.serialize() ||
+            !gatewayReadServeIdentity().getOrThrow().matches(identity) ||
+            managedRecoveryReadText(directory.join("inventory")).getOrThrow() != expectedHeader ||
+            gatewayServeStopParentPid(pid) != gatewayPid) { return 0 }
+        pid
+    } catch (_: Exception) { 0 }
+}
+
 private func gatewayServeStopCaptureResources(
     gatewayPid: Int64,
     brokerScript: Path,
     fixturePath: Path,
     readyPath: Path,
+    gatewayPort: Int64,
     timeoutMs: Int64
 ): GatewayServeStopResourceCapture {
     let captured = GatewayServeStopResourceCapture()
     let started = MonoTime.now()
     while ((MonoTime.now() - started).toMilliseconds() < timeoutMs) {
         if (!captured.brokerCaptured) {
-            let brokerPid = gatewayServeStopChildPid(gatewayPid, "metis-stdio-broker.mjs")
+            let brokerPid = gatewayServeStopFramedBrokerPid(gatewayPid, brokerScript, "http://127.0.0.1:${gatewayPort}/readyz")
             if (brokerPid > 1) {
                 captured.brokerStarted = true
                 if (gatewayServeStopCommandContains(brokerPid, brokerScript.toString()) &&
@@ -536,11 +590,15 @@ private class GatewayServeStopLiveOwnerProof {
     var httpStatus: Int64 = 0
     var running: Bool = false
     var ownerCount: Int64 = 0
+    var brokerPid: Int64 = 0
+    var brokerGeneration: Int64 = 0
 
     func refresh(url: String): Unit {
         this.httpStatus = 0
         this.running = false
         this.ownerCount = 0
+        this.brokerPid = 0
+        this.brokerGeneration = 0
         let builder = ClientBuilder()
         builder.readTimeout(Duration.millisecond * 500)
         let client = builder.build()
@@ -561,10 +619,14 @@ private class GatewayServeStopLiveOwnerProof {
                 .get("broker").getOrThrow().asObject()
             this.running = broker.get("running").getOrThrow().asBool().getValue()
             this.ownerCount = broker.get("ownerCount").getOrThrow().asInt().getValue()
+            this.brokerPid = broker.get("brokerPid").getOrThrow().asInt().getValue()
+            this.brokerGeneration = broker.get("generation").getOrThrow().asInt().getValue()
         } catch (_: Exception) {
             this.httpStatus = 0
             this.running = false
             this.ownerCount = 0
+            this.brokerPid = 0
+            this.brokerGeneration = 0
         } finally {
             client.close()
         }
@@ -1564,9 +1626,14 @@ private func gatewayHeartbeatBrokerIsFullyStopped(): Bool {
         snapshot.readerCount == 0 && snapshot.dispatcherCount == 0
 }
 
-private func withGatewayHeartbeatProbeEnvironment(name: String, block: (Path, Path) -> Unit): Unit {
+private func gatewayServeStopCreateCanonicalTestHome(path: Path): Path {
+    Directory.create(path, recursive: true)
+    canonicalize(path)
+}
+
+private func withGatewayHeartbeatProbeEnvironment(name: String, block: (Path, Path) -> Unit, retainEvidence!: Bool = false): Unit {
     synchronized(MetisProcessEnvironmentLock) {
-        let root = Path("/tmp/metis-heartbeat-probe-${name}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        let root = gatewayServeStopCreateCanonicalTestHome(Path("/tmp/metis-heartbeat-probe-${name}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"))
         let bin = root.join("bin")
         Directory.create(bin, recursive: true)
         let oldHome = getVariable("METIS_HOME")
@@ -1578,6 +1645,11 @@ private func withGatewayHeartbeatProbeEnvironment(name: String, block: (Path, Pa
         MetisConfigManager.invalidate()
         CliSettingManager.invalidate()
         try {
+            if (retainEvidence) {
+                File.writeTo(root.join("hr-formal-retained.owner"),
+                    "metis-hr-formal-retained-v1\ntestPid:${getProcessId()}\nname:${name}\n".toArray())
+                println("hr_formal_evidence basename=${root.fileName}")
+            }
             setGatewayServePortProbeForTest(None<(Int64, Int64) -> (Int64, String, String)>)
             let initialReset = resetManagedStdioBrokerForTest()
             @Expect(initialReset.ok, true)
@@ -1596,7 +1668,9 @@ private func withGatewayHeartbeatProbeEnvironment(name: String, block: (Path, Pa
             CliSettingManager.invalidate()
             let finalStopped = gatewayHeartbeatBrokerIsFullyStopped()
             @Expect(finalStopped, true)
+            if (!retainEvidence) {
             try { remove(root, recursive: true) } catch (_: Exception) { () }
+            }
         }
     }
 }
@@ -1642,7 +1716,7 @@ private func withHrFormalEnvironment(name: String, block: (Path, Path) -> Unit):
             setVariable("CURL_HOME", curl.toString())
             setVariable("XDG_CONFIG_HOME", curl.toString())
             block(home, bin)
-        })
+        }, retainEvidence: getVariable("METIS_GATEWAY_FORMAL_RETAIN_EVIDENCE") == Some("1"))
     } finally {
         hrFormalRestore("CURL_HOME", oldCurl)
         hrFormalRestore("XDG_CONFIG_HOME", oldXdg)
@@ -1858,7 +1932,7 @@ private class HrFormalGateway {
         @Expect(terminal.get("state").getOrThrow().asString().getValue(), "stopped")
     }
 
-    func concurrentRecoveredService(name: String): SubProcess {
+    func concurrentRecoveredService(name: String, expected: GatewayCrashRecoveryEvidence): SubProcess {
         let ready = this.home.join("${name}.ready")
         this.configure(["service", ready.toString(), this.home.join("${name}.release").toString(),
             this.home.join("${name}.stop").toString(), this.home.join("business.pending").toString(),
@@ -1880,7 +1954,8 @@ private class HrFormalGateway {
         this.awaitReady(winner, ready)
         @Expect(gatewayParseServeIdentity(hrFormalRead(this.home.join("gateway-serve.lock"))).getOrThrow().pid, winner.pid)
         @Expect(exists(this.home.join("gateway-serve.stop-complete")), false)
-        @Expect(hrFormalArchiveOriginals(this.home).size, 1)
+        @Expect(hrFormalInterruptedArchiveOriginals(this.home).size, 1)
+        hrFormalAssertInterruptedArchive(this.home, expected)
         var reconciled: Int64 = 0
         for (row in hrFormalRead(this.home.join("formal-gateway.log")).split("\n")) {
             if (row.contains("gateway.recovery.reconciled")) { reconciled++ }
@@ -1970,6 +2045,99 @@ private func hrFormalArchiveOriginals(home: Path): Array<String> {
 }
 
 
+private func hrFormalInterruptedArchiveOriginals(home: Path): Array<String> {
+    let result = ArrayList<String>()
+    let directory = home.join("gateway-serve.recovery-history")
+    if (!exists(directory)) { return [] }
+    for (entry in Directory.readFrom(directory)) {
+        if (entry.isRegular() && !entry.isSymbolicLink() && entry.name.endsWith(".interrupted-completion")) {
+            result.add(hrFormalRead(entry.path))
+        }
+    }
+    result.toArray()
+}
+
+private func hrFormalAssertInterruptedArchive(home: Path, expected: GatewayCrashRecoveryEvidence): Unit {
+    @Expect(expected.status, "recoverable")
+    @Expect(expected.kind, "interrupted_shutdown")
+    @Expect(expected.originalStopRequest.isEmpty(), false)
+    let completion = expected.originalCompletion.getOrThrow()
+    var completions: Int64 = 0
+    var locks: Int64 = 0
+    var requests: Int64 = 0
+    var evidence: Int64 = 0
+    var files: Int64 = 0
+    let bases = HashSet<String>()
+    for (entry in Directory.readFrom(home.join("gateway-serve.recovery-history"))) {
+        @Expect(entry.isRegular(), true)
+        @Expect(entry.isSymbolicLink(), false)
+        files += 1
+        if (entry.name.endsWith(".interrupted-completion")) {
+            completions += 1
+            bases.add(entry.name.removeSuffix(".interrupted-completion"))
+            @Expect(File.readFrom(entry.path), completion.toArray())
+        } else if (entry.name.endsWith(".crash-lock")) {
+            locks += 1
+            bases.add(entry.name.removeSuffix(".crash-lock"))
+            @Expect(File.readFrom(entry.path), expected.originalLock.toArray())
+        } else if (entry.name.endsWith(".crash-stop-request")) {
+            requests += 1
+            bases.add(entry.name.removeSuffix(".crash-stop-request"))
+            @Expect(File.readFrom(entry.path), expected.originalStopRequest.toArray())
+        } else if (entry.name.endsWith(".crash-evidence")) {
+            evidence += 1
+            bases.add(entry.name.removeSuffix(".crash-evidence"))
+            let original = "crash-recovery-v1\nstatus:resources_verified_before_retirement\n" +
+                "kind:interrupted_shutdown\ncompletion:cleanup_pending\n" + expected.inventory
+            @Expect(File.readFrom(entry.path), original.toArray())
+        }
+    }
+    @Expect(completions, 1)
+    @Expect(locks, 1)
+    @Expect(requests, 1)
+    @Expect(evidence, 1)
+    @Expect(files, 4)
+    @Expect(bases.size, 1)
+    @Expect(hrFormalInterruptedArchiveOriginals(home), [completion])
+    @Expect(hrFormalArchiveOriginals(home).size, 0)
+}
+
+// Copies only actual stopped-generation inputs. It neither creates a new lock
+// identity nor publishes resource facts, and returns every copied byte for recheck.
+private func hrFormalCopyStoppedInventoryFixture(source: Path, target: Path): HashMap<String, Array<UInt8>> {
+    let copied = HashMap<String, Array<UInt8>>()
+    let copyOne = { origin: Path, relative: String =>
+        let info = FileInfo(origin)
+        if (info.isSymbolicLink() || !info.isRegular()) { throw Exception("historical_copy_source_invalid") }
+        let bytes = File.readFrom(origin)
+        let destination = target.join(relative)
+        if (!exists(destination.parent)) { Directory.create(destination.parent, recursive: true) }
+        File.writeTo(destination, bytes)
+        @Assert(File.readFrom(destination), bytes)
+        copied[relative] = bytes
+    }
+    for (name in ["gateway-serve.lock", "gateway-serve.stop-request", "gateway-serve.stop-complete"]) {
+        copyOne(source.join(name), name)
+    }
+    let identity = gatewayParseServeIdentity(hrFormalRead(source.join("gateway-serve.lock"))).getOrThrow()
+    let inventoryName = "gateway-resource-inventory/${identity.pid}-${identity.startedAtMs}"
+    let inventory = source.join(inventoryName)
+    if (!managedRecoveryDirectorySafe(inventory)) { throw Exception("historical_copy_source_invalid") }
+    for (entry in Directory.readFrom(inventory)) { copyOne(entry.path, "${inventoryName}/${entry.name}") }
+    let leases = source.join("service-plugin/runtime")
+    for (plugin in Directory.readFrom(leases)) {
+        if (plugin.isSymbolicLink() || !plugin.isDirectory()) { throw Exception("historical_copy_source_invalid") }
+        for (entry in Directory.readFrom(plugin.path)) {
+            if (entry.name.endsWith(".lease.json")) {
+                let lease = JsonValue.fromStr(hrFormalRead(entry.path)).asObject()
+                @Assert(lease.get("state").getOrThrow().asString().getValue(), "stopped")
+                copyOne(entry.path, "service-plugin/runtime/${plugin.name}/${entry.name}")
+            }
+        }
+    }
+    copied
+}
+
 private func hrFormalPendingProof(formal: HrFormalGateway): String {
     let completion = formal.stopCurrent(1)
     @Expect(gatewayServeStopCompletionField(completion, "status"), "cleanup_pending")
@@ -2007,13 +2175,19 @@ private func hrFormalRecoveryChain(formal: HrFormalGateway): Unit {
     @Expect(hrFormalRead(formal.home.join("business.pending")), business)
     @Expect(exists(formal.home.join("business.effects")), false)
     formal.releaseWorker(worker)
-    let preview = gatewayHistoricalServeCompletionRecoveryStatus()
-    @Expect(preview.ok, true)
+    let preview = gatewayCollectCrashRecoveryEvidence(MonoTime.now() + Duration.second * 5)
     @Expect(preview.status, "recoverable")
+    @Expect(preview.kind, "interrupted_shutdown")
     @Expect(hrFormalRead(formal.home.join("gateway-serve.stop-complete")), original)
-    let winner = formal.concurrentRecoveredService("new")
+    @Expect(hrFormalRead(formal.home.join("gateway-serve.lock")), preview.originalLock)
+    @Expect(hrFormalRead(formal.home.join("gateway-serve.stop-request")), preview.originalStopRequest)
+    @Expect(preview.originalCompletion, Some(original))
+    let history = formal.home.join("gateway-serve.recovery-history")
+    let beforeCommitArchives = if (exists(history)) { Directory.readFrom(history).size } else { 0 }
+    @Expect(beforeCommitArchives, 0)
+    let winner = formal.concurrentRecoveredService("new", preview)
     @Expect(winner.pid != oldPid, true)
-    let archives = hrFormalArchiveOriginals(formal.home)
+    let archives = hrFormalInterruptedArchiveOriginals(formal.home)
     @Expect(archives.size, 1)
     @Expect(archives[0], original)
     @Expect(gatewayServeStopCompletionField(archives[0], "status"), "cleanup_pending")
@@ -2184,8 +2358,9 @@ private func gatewayTgStopReapGcm(pid: Int64, pgid: Int64, started: String, bina
 
 private func gatewayTgStopRestart(home: Path, binary: Path, old: SubProcess, oldBroker: Int64, oldGcm: Int64,
     oldGroup: Int64, gatewayPort: Int64, webhookPort: Int64, metrics: Path, events: Path,
-    statePath: Path, queuePath: Path, completedBusiness: Bool): Unit {
+    statePath: Path, queuePath: Path, completedBusiness: Bool): Bool {
     let capture = GatewayTgStopRestartCapture()
+    let pollProof = ArrayList<Bool>()
     let output = ArrayList<String>()
     let businessBytes = hrFormalRead(home.join("business.pending"))
     let processed = queuePath.join("processed").join("s5-p1-8802-end.json")
@@ -2202,6 +2377,7 @@ private func gatewayTgStopRestart(home: Path, binary: Path, old: SubProcess, old
         @Expect(!processedBytes.isEmpty(), true)
     }
     let originalProcessedBytes = processedBytes
+    var bodyFailure = None<Exception>
     @Expect(gatewayServeStopWaitUntil(5000, { => gatewayS5JsonInt(metrics, "pollActive") == 5 }), true)
     let started = MonoTime.now()
     try {
@@ -2220,14 +2396,24 @@ private func gatewayTgStopRestart(home: Path, binary: Path, old: SubProcess, old
             let drained = gatewayServeStopWaitUntil(1000, { => gatewayS5JsonInt(metrics, "active") == 0 })
             let rows = JsonValue.fromStr(hrFormalRead(metrics)).asObject().get("accounts").getOrThrow().asObject()
             var peersClosed: Int64 = 0
+            var pollCancellationProven = !exists(home.join("telegram-poll.release"))
             for (index in 0..5) {
                 let row = rows.get("${index}").getOrThrow().asObject()
                 peersClosed += row.get("peerClosed").getOrThrow().asInt().getValue()
+                let pollClosed = row.get("pollPeerClosed").getOrThrow().asInt().getValue() >= 1
+                let pollCompleted = row.get("pollCompleted").getOrThrow().asInt().getValue() == 0
+                let pollBeforeReadTimeout = row.get("maxPollElapsedMs").getOrThrow().asInt().getValue() <
+                    row.get("pollExpectedReadTimeoutMs").getOrThrow().asInt().getValue()
+                @Expect(pollClosed, true)
+                @Expect(pollCompleted, true)
+                @Expect(pollBeforeReadTimeout, true)
+                pollCancellationProven = pollCancellationProven && pollClosed && pollCompleted && pollBeforeReadTimeout
                 @Expect(row.get("pollActive").getOrThrow().asInt().getValue(), 0)
                 @Expect(row.get("confirmActive").getOrThrow().asInt().getValue(), 0)
                 @Expect(row.get("confirmEntered").getOrThrow().asInt().getValue(), 1)
                 @Expect(row.get("lastConfirmOffset").getOrThrow().asInt().getValue(), 43)
             }
+            pollProof.add(pollCancellationProven)
             let terminal = oldGatewayGone && oldBrokerGone && oldGcmGone && oldGroupGone && oldPortsGone && drained
             let proof = JsonObject()
             proof.put("formalBeforeReaper", true.toJsonValue())
@@ -2246,6 +2432,9 @@ private func gatewayTgStopRestart(home: Path, binary: Path, old: SubProcess, old
             proof.put("signalEvidenceBasis", JsonString("real_cli_return_before_original_request_deadline_and_exit0"))
             proof.put("metricsBeforeNewGeneration", JsonValue.fromStr(hrFormalRead(metrics)))
             proof.put("peerClosed", peersClosed.toJsonValue())
+            proof.put("pollCancellationProven", pollCancellationProven.toJsonValue())
+            proof.put("pollReleaseAbsent", (!exists(home.join("telegram-poll.release"))).toJsonValue())
+            @Expect(exists(home.join("telegram-poll.release")), false)
             proof.put("fullTerminal", JsonString(gatewayServeStopCompletionField(completion, "fullTerminal")))
             proof.put("pending", JsonString(gatewayServeStopCompletionField(completion, "servicePluginPendingCount")))
             proof.put("gatewayBinarySha256", JsonString(gatewayTgStopSha256(binary)))
@@ -2269,7 +2458,7 @@ private func gatewayTgStopRestart(home: Path, binary: Path, old: SubProcess, old
         @Expect(restarted, 0)
         @Expect(capture.launchCount, 1)
         @Expect(capture.process.isSome(), true)
-        if (capture.process.isNone()) { return }
+        if (capture.process.isNone()) { return false }
         let replacement = capture.process.getOrThrow()
         @Expect(replacement.pid != old.pid, true)
         capture.identity = gatewayServeStopCaptureOwnedIdentity(home, replacement.pid, binary, 10000)
@@ -2330,20 +2519,33 @@ private func gatewayTgStopRestart(home: Path, binary: Path, old: SubProcess, old
                 @Expect(gatewayS5EventCount(events, kind, "s5-p1-8802-end"), 1)
             }
         }
-    } finally {
-        setGatewayStopOutputForTest(None<(String) -> Unit>)
-        File.writeTo(home.join("telegram-confirm.release"), "release\n".toArray())
-        gatewayServeStopReapOwnedGateway(capture.identity, binary, home)
-        gatewayServeStopReapOwnedHandle(capture.process, binary)
-        @Expect(gatewayServeStopWaitOwnedProcess(capture.process), true)
-        gatewayTgStopReapGcm(capture.gcmPid, capture.gcmPgid, capture.gcmStart, home.join("gitcodemonitor"))
+    } catch (failure: Exception) { bodyFailure = Some(failure) }
+    finally {
+        let cleanupFailures = ArrayList<Exception>()
+        let attempt = { action: () -> Unit =>
+            try { action() }
+            catch (failure: Exception) { if (cleanupFailures.isEmpty()) { cleanupFailures.add(failure) } }
+        }
+        attempt({ => setGatewayStopOutputForTest(None<(String) -> Unit>) })
+        attempt({ => File.writeTo(home.join("telegram-confirm.release"), "release\n".toArray()) })
+        attempt({ => gatewayServeStopReapOwnedGateway(capture.identity, binary, home) })
+        attempt({ => gatewayServeStopReapOwnedHandle(capture.process, binary) })
+        attempt({ =>
+            let waited = gatewayServeStopWaitOwnedProcess(capture.process)
+            @Expect(waited, true)
+            if (!waited) { throw Exception("tgstop_gateway_cleanup_pending") }
+        })
+        attempt({ => gatewayTgStopReapGcm(capture.gcmPid, capture.gcmPgid, capture.gcmStart, home.join("gitcodemonitor")) })
         match (capture.stopProcess) {
             case Some(process) =>
-                if (process.isAlive()) { process.terminate(force: true) }
-                let _ = process.wait(timeout: Some(Duration.second * 2))
+                attempt({ => if (process.isAlive()) { process.terminate(force: true) } })
+                attempt({ => let _ = process.wait(timeout: Some(Duration.second * 2)) })
             case None => ()
         }
+        if (bodyFailure.isNone() && !cleanupFailures.isEmpty()) { bodyFailure = Some(cleanupFailures[0]) }
+        if (let Some(failure) <- bodyFailure) { throw failure }
     }
+    pollProof.size == 1 && pollProof[0]
 }
 
 private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInbound: Bool, releaseConfirmation: Bool,
@@ -2351,14 +2553,16 @@ private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInboun
     synchronized(MetisProcessEnvironmentLock) {
         let evidenceRootText = getVariable("METIS_TGSTOP_EVIDENCE_ROOT").getOrDefault { "" }
         let retainEvidence = !evidenceRootText.isEmpty()
-        let evidenceRoot = if (retainEvidence) { Path(evidenceRootText) } else {
+        let unresolvedEvidenceRoot = if (retainEvidence) { Path(evidenceRootText) } else {
             Path("/tmp/metis-tgstop-evidence-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
         }
-        if (!retainEvidence) { Directory.create(evidenceRoot) }
+        if (!retainEvidence) { Directory.create(unresolvedEvidenceRoot) }
+        let evidenceRoot = canonicalize(unresolvedEvidenceRoot)
         let rootInode = gatewayTgStopInode(evidenceRoot)
-        let home = evidenceRoot.join("${name}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
-        gatewayTgStopRegister(evidenceRoot, home, "planned-absent")
-        Directory.create(home)
+        let unresolvedHome = evidenceRoot.join("${name}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        gatewayTgStopRegister(evidenceRoot, unresolvedHome, "planned-absent")
+        Directory.create(unresolvedHome)
+        let home = canonicalize(unresolvedHome)
         gatewayTgStopRegister(evidenceRoot, home, "created")
         let project = Path(getVariable("METIS_CJPM_ROOT").getOrDefault { "" })
         let binary = gatewayFormalMetisBinary(project).getOrThrow()
@@ -2388,6 +2592,7 @@ private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInboun
         let oldWorkspaceDirOverride = CliConfig.workspaceDirOverride
         let metrics = home.join("telegram-metrics.json")
         let release = home.join("telegram-confirm.release")
+        let pollRelease = home.join("telegram-poll.release")
         let gate = home.join("telegram-gate.json")
         let gatewayPort = gatewayServeStopTemporaryPort()
         let webhookPort = gatewayServeStopTemporaryPort()
@@ -2400,6 +2605,8 @@ private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInboun
         var gcmPgid: Int64 = 0
         var gcmStart = ""
         var formalRecorded = false
+        var pollCancellationProven = false
+        var bodyFailure = None<Exception>
         try {
             let curl = home.join("curl")
             Directory.create(curl)
@@ -2424,6 +2631,8 @@ private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInboun
             config.put("confirmMode", JsonString(if (failConfirmation) { "success" } else { "hold" }))
             if (failConfirmation) { config.put("failAccount", JsonString("2")) }
             config.put("pollDelayMs", 1000.toJsonValue())
+            config.put("pollMode", JsonString("hold"))
+            config.put("pollReleasePath", JsonString(pollRelease.toString()))
             File.writeTo(gate, config.toJsonString().toArray())
             dependencies = Some(gatewayS5StartDependencies(home,
                 project.join("scripts").join("metis-s5-loopback-dependencies.mjs"), telegramGate: Some(gate)))
@@ -2519,7 +2728,7 @@ private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInboun
             }
             File.writeTo(home.join("actor-proof.json"), proof.toJsonString().toArray())
             if (restart) {
-                gatewayTgStopRestart(home, binary, launched, brokerPid, gcmPid, gcmPgid, gatewayPort,
+                pollCancellationProven = gatewayTgStopRestart(home, binary, launched, brokerPid, gcmPid, gcmPgid, gatewayPort,
                     webhookPort, metrics, dependency.eventsPath, configured[0], configured[1], failConfirmation)
                 formalRecorded = true
                 return
@@ -2550,7 +2759,24 @@ private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInboun
             proof.put("confirmEntered", gatewayS5JsonInt(metrics, "confirmEntered").toJsonValue())
             proof.put("completionPresent", (!completion.isEmpty()).toJsonValue())
             proof.put("fullTerminal", JsonString(gatewayServeStopCompletionField(completion, "fullTerminal")))
-            proof.put("metricsBeforeReaper", JsonValue.fromStr(hrFormalRead(metrics)))
+            let metricsBeforeReaper = JsonValue.fromStr(hrFormalRead(metrics))
+            proof.put("metricsBeforeReaper", metricsBeforeReaper)
+            proof.put("pollReleaseAbsent", (!exists(pollRelease)).toJsonValue())
+            @Expect(exists(pollRelease), false)
+            pollCancellationProven = !exists(pollRelease)
+            let pollRows = metricsBeforeReaper.asObject().get("accounts").getOrThrow().asObject()
+            for (index in 0..accountCount) {
+                let row = pollRows.get("${index}").getOrThrow().asObject()
+                let pollClosed = row.get("pollPeerClosed").getOrThrow().asInt().getValue() >= 1
+                let pollCompleted = row.get("pollCompleted").getOrThrow().asInt().getValue() == 0
+                let pollBeforeReadTimeout = row.get("maxPollElapsedMs").getOrThrow().asInt().getValue() <
+                    row.get("pollExpectedReadTimeoutMs").getOrThrow().asInt().getValue()
+                @Expect(pollClosed, true)
+                @Expect(pollCompleted, true)
+                @Expect(pollBeforeReadTimeout, true)
+                pollCancellationProven = pollCancellationProven && pollClosed && pollCompleted && pollBeforeReadTimeout
+            }
+            proof.put("pollCancellationProven", pollCancellationProven.toJsonValue())
             if (failSecondaryState) {
                 let failedState = hrFormalRead(home.join("s5-gateway.log")).contains("platform state persistence failed")
                 let naturalExit = launched.wait(timeout: Some(Duration.second * 2))
@@ -2592,58 +2818,90 @@ private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInboun
                     .get("accounts").getOrThrow().asObject().get("0").getOrThrow().asObject()
                 @Expect(observed.get("lastConfirmOffset").getOrThrow().asInt().getValue(), 43)
             }
-        } finally {
-            File.writeTo(release, "release\n".toArray())
-            gatewayServeStopReapOwnedGateway(identity, binary, home)
-            gatewayServeStopReapOwnedHandle(gatewayProcess, binary)
-            @Expect(gatewayServeStopWaitOwnedProcess(gatewayProcess), true)
-            match (cliProcess) {
-                case Some(process) =>
-                    if (process.isAlive()) { process.terminate(force: true) }
-                    let _ = process.wait(timeout: Some(Duration.second * 2))
-                case None => ()
+        } catch (failure: Exception) { bodyFailure = Some(failure) }
+        finally {
+            let cleanupFailures = ArrayList<Exception>()
+            let attempt = { action: () -> Unit =>
+                try { action() }
+                catch (failure: Exception) { if (cleanupFailures.isEmpty()) { cleanupFailures.add(failure) } }
             }
-            if (gcmPid > 1 && !gcmStart.isEmpty() && gatewayServeStopPidAlive(gcmPid)) {
-                let current = executeWithOutput("/bin/ps", ["-o", "lstart=", "-p", "${gcmPid}"])
-                let currentStart = try { String.fromUtf8(current[1]).trimAscii() } catch (_: Exception) { "" }
-                if (currentStart == gcmStart && gatewayServeStopProcessGroup(gcmPid) == gcmPgid &&
-                    gatewayServeStopCommandContains(gcmPid, gcmBinary.toString())) {
-                    let _ = executeWithOutput("/bin/kill", ["-TERM", "${gcmPid}"])
-                }
-            }
-            @Expect(gatewayS5StopDependencies(dependencies), true)
+            let ownedIdentity = identity
+            let ownedGateway = gatewayProcess
+            let ownedCli = cliProcess
+            let ownedDependencies = dependencies
+            let ownedGcmPid = gcmPid
+            let ownedGcmGroup = gcmPgid
+            let ownedGcmStart = gcmStart
             let capturedBrokerPid = brokerPid
             let capturedGcmPid = gcmPid
-            let resourcesGone = gatewayServeStopWaitUntil(5000, { =>
-                !gatewayServeStopPidAlive(capturedBrokerPid) && !gatewayServeStopPidAlive(capturedGcmPid) &&
-                    !gatewayServeStopPortListening(gatewayPort) && !gatewayServeStopPortListening(webhookPort)
+            attempt({ => File.writeTo(pollRelease, "release\n".toArray()) })
+            attempt({ => File.writeTo(release, "release\n".toArray()) })
+            attempt({ => gatewayServeStopReapOwnedGateway(ownedIdentity, binary, home) })
+            attempt({ => gatewayServeStopReapOwnedHandle(ownedGateway, binary) })
+            attempt({ =>
+                let waited = gatewayServeStopWaitOwnedProcess(ownedGateway)
+                @Expect(waited, true)
+                if (!waited) { throw Exception("tgstop_gateway_cleanup_pending") }
             })
-            @Expect(resourcesGone, true)
-            File.writeTo(home.join("cleanup-proof.json"), ("{\"resourcesGone\":${resourcesGone}}").toArray())
-            gatewayTgStopRegister(evidenceRoot, home, "retained-for-authorized-CAS-cleanup")
-            if (!retainEvidence && formalRecorded && resourcesGone && !rootInode.isEmpty() &&
-                gatewayTgStopInode(evidenceRoot) == rootInode) {
-                remove(evidenceRoot, recursive: true)
+            match (ownedCli) {
+                case Some(process) =>
+                    attempt({ => if (process.isAlive()) { process.terminate(force: true) } })
+                    attempt({ => let _ = process.wait(timeout: Some(Duration.second * 2)) })
+                case None => ()
             }
-            for ((key, old) in previous) { hrFormalRestore(key, old) }
-            CliConfig._model = oldPrimaryModel
-            CliConfig.fallbackModels = oldFallbackModels
-            CliConfig._imageModel = oldImageModel
-            CliConfig.imageFallbackModels = oldImageFallbackModels
-            CliConfig._pdfModel = oldPdfModel
-            CliConfig.pdfFallbackModels = oldPdfFallbackModels
-            CliConfig.pdfMaxBytesMb = oldPdfMaxBytesMb
-            CliConfig.pdfMaxPages = oldPdfMaxPages
-            CliConfig._fastModel = oldFastModel
-            CliConfig.temperature = oldTemperature
-            CliConfig.defaultModelInputLimit = oldDefaultModelInputLimit
-            CliConfig.defaultModelOutputLimit = oldDefaultModelOutputLimit
-            CliConfig.workspaceDirOverride = oldWorkspaceDirOverride
-            CliConfig.invalidatePathCache()
-            MetisConfigManager.invalidate()
-            CliSettingManager.invalidate()
-            gatewayLoggingResetForTest()
-            Config.logFile = oldLog
+            attempt({ =>
+                if (ownedGcmPid > 1 && !ownedGcmStart.isEmpty() && gatewayServeStopPidAlive(ownedGcmPid)) {
+                    let current = executeWithOutput("/bin/ps", ["-o", "lstart=", "-p", "${ownedGcmPid}"])
+                    let currentStart = try { String.fromUtf8(current[1]).trimAscii() } catch (_: Exception) { "" }
+                    if (currentStart == ownedGcmStart && gatewayServeStopProcessGroup(ownedGcmPid) == ownedGcmGroup &&
+                        gatewayServeStopCommandContains(ownedGcmPid, gcmBinary.toString())) {
+                        let _ = executeWithOutput("/bin/kill", ["-TERM", "${ownedGcmPid}"])
+                    }
+                }
+            })
+            attempt({ =>
+                let stopped = gatewayS5StopDependencies(ownedDependencies)
+                @Expect(stopped, true)
+                if (!stopped) { throw Exception("tgstop_dependency_cleanup_pending") }
+            })
+            let resourceResults = ArrayList<Bool>()
+            attempt({ =>
+                resourceResults.add(gatewayServeStopWaitUntil(5000, { =>
+                    !gatewayServeStopPidAlive(capturedBrokerPid) && !gatewayServeStopPidAlive(capturedGcmPid) &&
+                        !gatewayServeStopPortListening(gatewayPort) && !gatewayServeStopPortListening(webhookPort)
+                }))
+            })
+            let resourcesGone = resourceResults.size == 1 && resourceResults[0]
+            @Expect(resourcesGone, true)
+            attempt({ => File.writeTo(home.join("cleanup-proof.json"), ("{\"resourcesGone\":${resourcesGone}}").toArray()) })
+            attempt({ => gatewayTgStopRegister(evidenceRoot, home, "retained-for-authorized-CAS-cleanup") })
+            for ((key, old) in previous) { attempt({ => hrFormalRestore(key, old) }) }
+            attempt({ => CliConfig._model = oldPrimaryModel })
+            attempt({ => CliConfig.fallbackModels = oldFallbackModels })
+            attempt({ => CliConfig._imageModel = oldImageModel })
+            attempt({ => CliConfig.imageFallbackModels = oldImageFallbackModels })
+            attempt({ => CliConfig._pdfModel = oldPdfModel })
+            attempt({ => CliConfig.pdfFallbackModels = oldPdfFallbackModels })
+            attempt({ => CliConfig.pdfMaxBytesMb = oldPdfMaxBytesMb })
+            attempt({ => CliConfig.pdfMaxPages = oldPdfMaxPages })
+            attempt({ => CliConfig._fastModel = oldFastModel })
+            attempt({ => CliConfig.temperature = oldTemperature })
+            attempt({ => CliConfig.defaultModelInputLimit = oldDefaultModelInputLimit })
+            attempt({ => CliConfig.defaultModelOutputLimit = oldDefaultModelOutputLimit })
+            attempt({ => CliConfig.workspaceDirOverride = oldWorkspaceDirOverride })
+            attempt({ => CliConfig.invalidatePathCache() })
+            attempt({ => MetisConfigManager.invalidate() })
+            attempt({ => CliSettingManager.invalidate() })
+            attempt({ => gatewayLoggingResetForTest() })
+            attempt({ => Config.logFile = oldLog })
+            if (!retainEvidence && formalRecorded && bodyFailure.isNone() && cleanupFailures.isEmpty() &&
+                pollCancellationProven && resourcesGone && !rootInode.isEmpty()) {
+                attempt({ =>
+                    if (gatewayTgStopInode(evidenceRoot) == rootInode) { remove(evidenceRoot, recursive: true) }
+                })
+            }
+            if (bodyFailure.isNone() && !cleanupFailures.isEmpty()) { bodyFailure = Some(cleanupFailures[0]) }
+            if (let Some(failure) <- bodyFailure) { throw failure }
         }
     }
 }
@@ -2761,52 +3019,80 @@ public class GatewayServeLockLogicTest {
                 let worker = formal.startPendingGeneration()
                 let original = hrFormalPendingProof(formal)
                 formal.releaseWorker(worker)
-                let sourceLease = gatewayS5FindLease(home)
-                let leaseBytes = File.readFrom(sourceLease)
-                // Negative fixture copies originate in a real stopped generation.
-                // The original home/marker is never mutated by fault injection.
+                let originalEvidence = gatewayCollectCrashRecoveryEvidence(MonoTime.now() + Duration.second * 5)
+                @Expect(originalEvidence.status, "recoverable")
+                @Expect(originalEvidence.originalCompletion, Some(original))
+                // Every negative input is an exact copy of this real stopped generation.
+                // A copied old lock is never replaced with the test parent's identity.
                 for (mode in ["timeout", "replacement", "encoding"]) {
-                    let negative = home.join("negative-${mode}")
-                    Directory.create(negative, recursive: true)
-                    setVariable("METIS_HOME", negative.toString())
-                    CliConfig.invalidatePathCache()
-                    MetisConfigManager.invalidate()
-                    CliSettingManager.invalidate()
+                    let directory = home.join("negative-${mode}")
+                    Directory.create(directory, recursive: true)
+                    let negative = canonicalize(directory)
+                    let previousHome = getVariable("METIS_HOME")
+                    var bodyFailure = None<Exception>
                     try {
+                        setVariable("METIS_HOME", negative.toString())
+                        CliConfig.invalidatePathCache()
+                        MetisConfigManager.invalidate()
+                        CliSettingManager.invalidate()
                         var settings = CliSettingManager.readGatewaySettings()
                         settings.enabled = true
                         settings.port = formal.port
                         let _ = MetisConfigManager.setGatewaySettings(settings)
                         CliSettingManager.invalidate()
-                        @Expect(gatewayAcquireServeLockForRunningProcess(), true)
-                        let leaseDir = negative.join("service-plugin/runtime/gitcode-monitor")
-                        Directory.create(leaseDir, recursive: true)
-                        File.writeTo(leaseDir.join(sourceLease.fileName), leaseBytes)
+                        let copied = hrFormalCopyStoppedInventoryFixture(home, negative)
                         let marker = negative.join("gateway-serve.stop-complete")
-                        File.writeTo(marker, original.toArray())
-                        let evidence = gatewayCollectHistoricalRecoveryEvidence(MonoTime.now() + Duration.second * 5)
+                        let evidence = gatewayCollectCrashRecoveryEvidence(MonoTime.now() + Duration.second * 5)
                         @Expect(evidence.status, "recoverable")
+                        @Expect(evidence.originalLock, originalEvidence.originalLock)
+                        @Expect(evidence.originalStopRequest, originalEvidence.originalStopRequest)
+                        @Expect(evidence.originalCompletion, originalEvidence.originalCompletion)
+                        @Expect(evidence.inventory, originalEvidence.inventory)
                         let replacement = original.replace("nonce:", "nonce:replacement-中文😀-")
                         if (mode == "replacement") { File.writeTo(marker, replacement.toArray()) }
                         if (mode == "encoding") { File.writeTo(marker, [255u8, 254u8]) }
                         let deadline = if (mode == "timeout") { MonoTime.now() - Duration.millisecond } else { MonoTime.now() + Duration.second * 5 }
-                        let committed = gatewayCommitHistoricalRecovery(evidence, deadline)
+                        let committed = gatewayCommitCrashRecovery(evidence, deadline)
                         @Expect(committed.ok, false)
-                        @Expect(committed.status, if (mode == "timeout") { "deadline_exceeded" } else if (mode == "replacement") { "identity_changed" } else { "invalid_response_encoding" })
+                        @Expect(committed.status, if (mode == "timeout") { "claim_busy" } else if (mode == "replacement") { "completion_identity_mismatch" } else { "completion_invalid" })
                         @Expect(exists(marker), true)
                         if (mode == "encoding") { @Expect(File.readFrom(marker), [255u8, 254u8]) }
                         else { @Expect(hrFormalRead(marker), if (mode == "replacement") { replacement } else { original }) }
-                    } finally {
-                        gatewayReleaseServeLockQuiet()
-                        @Expect(exists(negative.join("gateway-serve.lock")), false)
-                        setVariable("METIS_HOME", home.toString())
-                        CliConfig.invalidatePathCache()
-                        MetisConfigManager.invalidate()
-                        CliSettingManager.invalidate()
+                        for ((relative, bytes) in copied) {
+                            @Expect(File.readFrom(home.join(relative)), bytes)
+                            if (relative != "gateway-serve.stop-complete") {
+                                @Expect(File.readFrom(negative.join(relative)), bytes)
+                            }
+                        }
+                        let history = negative.join("gateway-serve.recovery-history")
+                        let archiveCount = if (exists(history)) { Directory.readFrom(history).size } else { 0 }
+                        @Expect(archiveCount, 0)
+                    } catch (failure: Exception) { bodyFailure = Some(failure) }
+                    finally {
+                        let cleanupFailures = ArrayList<Exception>()
+                        let attempt = { action: () -> Unit =>
+                            try { action() }
+                            catch (failure: Exception) { if (cleanupFailures.isEmpty()) { cleanupFailures.add(failure) } }
+                        }
+                        // No releaseQuiet: neither these copied old locks nor their bytes are ours to discard.
+                        attempt({ => hrFormalRestore("METIS_HOME", previousHome) })
+                        attempt({ => CliConfig.invalidatePathCache() })
+                        attempt({ => MetisConfigManager.invalidate() })
+                        attempt({ => CliSettingManager.invalidate() })
+                        if (bodyFailure.isNone() && !cleanupFailures.isEmpty()) { bodyFailure = Some(cleanupFailures[0]) }
+                        if (let Some(failure) <- bodyFailure) { throw failure }
                     }
                 }
                 @Expect(hrFormalRead(home.join("gateway-serve.stop-complete")), original)
+                @Expect(hrFormalRead(home.join("gateway-serve.lock")), originalEvidence.originalLock)
+                @Expect(hrFormalRead(home.join("gateway-serve.stop-request")), originalEvidence.originalStopRequest)
                 hrFormalAssertAllLeasesStopped(home)
+                // This extra real operation keeps its existing60s API budget; it is not a preview.
+                @Expect(gatewayExecuteStopServe(), 0)
+                @Expect(exists(home.join("gateway-serve.lock")), false)
+                @Expect(exists(home.join("gateway-serve.stop-request")), false)
+                @Expect(exists(home.join("gateway-serve.stop-complete")), false)
+                hrFormalAssertInterruptedArchive(home, originalEvidence)
                 formal.assertClean()
             } finally { formal.cleanup() }
         })
@@ -2861,23 +3147,104 @@ public class GatewayServeLockLogicTest {
             try {
                 let worker = formal.startPendingGeneration()
                 let original = hrFormalPendingProof(formal)
+                let lock = home.join("gateway-serve.lock")
+                let request = home.join("gateway-serve.stop-request")
+                let marker = home.join("gateway-serve.stop-complete")
+                let history = home.join("gateway-serve.recovery-history")
+                let originalLock = File.readFrom(lock)
+                let originalRequest = File.readFrom(request)
+                let originalCompletion = File.readFrom(marker)
+                @Expect(originalCompletion, original.toArray())
+                let identity = gatewayParseServeIdentity(original).getOrThrow()
                 let port = hrFormalNumber(home.join("old-worker.ready"), "port")
+                // The old completion-only preview must keep its frozen pending guard.
                 let checked = gatewayHistoricalServeCompletionRecoveryStatus()
                 @Expect(checked.ok, false)
-                @Expect(checked.status, "lease_active")
+                @Expect(checked.status, "resources_not_terminal")
+                let activeDeadline = MonoTime.now() + Duration.second * 5
+                let active = gatewayCollectCrashRecoveryEvidence(activeDeadline)
+                @Expect(active.status, "port_active")
+                let lease = probeServicePluginHistoricalResources(identity.pid, identity.startedAtMs,
+                    activeDeadline, allowStaleActiveLease: false)
+                @Expect(lease.conclusive, true)
+                @Expect(lease.terminal, false)
+                @Expect(lease.status, "lease_active")
+                @Expect(gatewayAcquireServeLockForRunningProcess(), false)
+                @Expect(File.readFrom(lock), originalLock)
+                @Expect(File.readFrom(request), originalRequest)
+                @Expect(File.readFrom(marker), originalCompletion)
+                let afterAdmissionArchives = if (exists(history)) { Directory.readFrom(history).size } else { 0 }
+                @Expect(afterAdmissionArchives, 0)
                 let launchCount = AtomicInt64(0)
                 @Expect(gatewayExecuteRestartServe(launchServe: { => let _ = launchCount.fetchAdd(1); true }), 1)
                 @Expect(launchCount.load(), 0)
-                @Expect(hrFormalRead(home.join("gateway-serve.stop-complete")), original)
+                @Expect(hrFormalRead(marker), original)
+                @Expect(File.readFrom(lock), originalLock)
+                @Expect(File.readFrom(request), originalRequest)
+                @Expect(File.readFrom(marker), originalCompletion)
                 @Expect(hrFormalArchiveOriginals(home).size, 0)
+                let beforeReleaseArchives = if (exists(history)) { Directory.readFrom(history).size } else { 0 }
+                @Expect(beforeReleaseArchives, 0)
                 @Expect(worker.isAlive(), true)
                 @Expect(gatewayServeStopPortListening(port), true)
                 @Expect(exists(home.join("old-worker.release")), false)
-                // The real active work component self-terminates only on release.
-                // Actual blocked host dispatch is additionally covered by the S0/S3 host cases.
+                // Releasing actual work changes resources, never the historical marker or lock.
                 formal.releaseWorker(worker)
-                @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "recoverable")
-                @Expect(hrFormalRead(home.join("gateway-serve.stop-complete")), original)
+                let released = gatewayCollectCrashRecoveryEvidence(MonoTime.now() + Duration.second * 5)
+                @Expect(released.status, "recoverable")
+                @Expect(released.kind, "interrupted_shutdown")
+                @Expect(released.originalLock.toArray(), originalLock)
+                @Expect(released.originalStopRequest.toArray(), originalRequest)
+                @Expect(released.originalCompletion, Some(original))
+                @Expect(hrFormalRead(marker), original)
+                @Expect(File.readFrom(lock), originalLock)
+                @Expect(File.readFrom(request), originalRequest)
+                @Expect(File.readFrom(marker), originalCompletion)
+                let beforeCommitArchives = if (exists(history)) { Directory.readFrom(history).size } else { 0 }
+                @Expect(beforeCommitArchives, 0)
+                // One additional real stop uses its existing60s API budget, explicitly admitted for this pilot.
+                @Expect(gatewayExecuteStopServe(), 0)
+                @Expect(launchCount.load(), 0)
+                @Expect(exists(lock), false)
+                @Expect(exists(request), false)
+                @Expect(exists(marker), false)
+                var interrupted: Int64 = 0
+                var locks: Int64 = 0
+                var requests: Int64 = 0
+                var evidence: Int64 = 0
+                var files: Int64 = 0
+                let archiveBases = HashSet<String>()
+                for (entry in Directory.readFrom(history)) {
+                    @Expect(entry.isRegular(), true)
+                    @Expect(entry.isSymbolicLink(), false)
+                    files += 1
+                    if (entry.name.endsWith(".interrupted-completion")) {
+                        interrupted += 1
+                        archiveBases.add(entry.name.removeSuffix(".interrupted-completion"))
+                        @Expect(File.readFrom(entry.path), originalCompletion)
+                    } else if (entry.name.endsWith(".crash-lock")) {
+                        locks += 1
+                        archiveBases.add(entry.name.removeSuffix(".crash-lock"))
+                        @Expect(File.readFrom(entry.path), originalLock)
+                    } else if (entry.name.endsWith(".crash-stop-request")) {
+                        requests += 1
+                        archiveBases.add(entry.name.removeSuffix(".crash-stop-request"))
+                        @Expect(File.readFrom(entry.path), originalRequest)
+                    } else if (entry.name.endsWith(".crash-evidence")) {
+                        evidence += 1
+                        archiveBases.add(entry.name.removeSuffix(".crash-evidence"))
+                        let expected = "crash-recovery-v1\nstatus:resources_verified_before_retirement\n" +
+                            "kind:interrupted_shutdown\ncompletion:cleanup_pending\n" + released.inventory
+                        @Expect(File.readFrom(entry.path), expected.toArray())
+                    }
+                }
+                @Expect(interrupted, 1)
+                @Expect(locks, 1)
+                @Expect(requests, 1)
+                @Expect(evidence, 1)
+                @Expect(files, 4)
+                @Expect(archiveBases.size, 1)
+                @Expect(hrFormalArchiveOriginals(home).size, 0)
                 formal.assertClean()
             } finally { formal.cleanup() }
         })
@@ -2895,8 +3262,6 @@ public class GatewayServeLockLogicTest {
     public func hrS2B2FormalArchiveBarrierRejectsCompetingServe(): Unit {
         withHrFormalEnvironment("hr-s2b2-archive", { home, _ =>
             let formal = HrFormalGateway(home)
-            let previousPath = getVariable("PATH")
-            let release = home.join("lsof-archive-release")
             try {
                 let old = formal.startService("old", nonzeroBroker: true)
                 let original = formal.stopCurrent(1)
@@ -2907,24 +3272,138 @@ public class GatewayServeLockLogicTest {
                 formal.configure(["service", ready.toString(), home.join("new.release").toString(),
                     home.join("new.stop").toString(), home.join("business.pending").toString(),
                     home.join("business.receipt").toString(), home.join("business.effects").toString()])
-                let bin = home.join("lsof-forwarder-bin")
-                Directory.create(bin)
-                File.writeTo(home.join("lsof-gateway-port"), "${formal.port}".toArray())
-                @Expect(executeWithOutput("/bin/ln", ["-s", formal.fixture.toString(), bin.join("lsof").toString()])[0], 0)
-                setVariable("PATH", bin.toString() + ":" + previousPath.getOrDefault { "" })
-                let first = try { formal.launchGateway(directServe: true) }
-                    finally { hrFormalRestore("PATH", previousPath) }
-                let entered = home.join("lsof-archive-entered")
-                @Expect(gatewayServeStopWaitUntil(5000, { => exists(entered) }), true)
-                @Expect(first.isAlive(), true)
-                @Expect(exists(ready), false)
-                let marker = home.join("gateway-serve.stop-complete")
                 let lock = home.join("gateway-serve.lock")
+                let request = home.join("gateway-serve.stop-request")
+                let marker = home.join("gateway-serve.stop-complete")
+                let originalLock = File.readFrom(lock)
+                let originalRequest = File.readFrom(request)
+                let originalCompletion = File.readFrom(marker)
+                @Expect(originalCompletion, original.toArray())
+                let oldIdentity = gatewayParseServeIdentity(hrFormalRead(lock)).getOrThrow()
+                @Expect(oldIdentity.pid, old.pid)
+                let inventory = gatewayRecoveryInventoryPath(oldIdentity)
+                let inventoryFiles = HashMap<String, Array<UInt8>>()
+                for (entry in Directory.readFrom(inventory)) { inventoryFiles[entry.name] = File.readFrom(entry.path) }
+                let generationRoot = home.join("gateway-resource-inventory")
+                @Expect(Directory.readFrom(generationRoot).size, 1)
+                @Expect(exists(home.join("business.effects")), false)
+                // This new public commit/held-CLI action shares one5s deadline; product claim stays3s.
+                let deadline = MonoTime.now() + Duration.second * 5
+                let expected = gatewayCollectCrashRecoveryEvidence(deadline)
+                @Assert(expected.status, "recoverable")
+                @Expect(expected.kind, "interrupted_shutdown")
+                @Expect(expected.originalCompletion, Some(original))
+                @Expect(expected.originalLock.toArray(), originalLock)
+                @Expect(expected.originalStopRequest.toArray(), originalRequest)
+                let hooks = AtomicInt64(0)
+                let recovered = gatewayCommitCrashRecovery(expected, deadline, afterArchive: { =>
+                    let _ = hooks.fetchAdd(1)
+                    var held = None<SubProcess>
+                    var reaped = false
+                    var launchPending = false
+                    var bodyFailure = None<Exception>
+                    try {
+                        hrFormalAssertInterruptedArchive(home, expected)
+                        @Expect(File.readFrom(lock), originalLock)
+                        @Expect(File.readFrom(request), originalRequest)
+                        @Expect(File.readFrom(marker), originalCompletion)
+                        @Expect(gatewayParseServeIdentity(hrFormalRead(lock)).getOrThrow().pid, old.pid)
+                        @Expect(exists(ready), false)
+                        @Expect(exists(home.join("business.effects")), false)
+                        @Assert(MonoTime.now() < deadline, true)
+                        let heldAt = MonoTime.now()
+                        launchPending = true
+                        let competitor = formal.launchGateway(directServe: true)
+                        held = Some(competitor)
+                        launchPending = false
+                        let remaining = deadline - MonoTime.now()
+                        if (remaining <= Duration.Zero) { throw Exception("hr_b2_commit_deadline_exceeded") }
+                        let code = competitor.wait(timeout: Some(remaining))
+                        reaped = true
+                        let heldMs = (MonoTime.now() - heldAt).toMilliseconds()
+                        let refusal = hrFormalRead(formal.stdoutFiles.get(competitor.pid).getOrThrow())
+                            .contains("无法启动：检测到已有网关实例在运行，或锁文件")
+                        let oldFilesUnchanged = hrFormalRead(lock) == expected.originalLock &&
+                            hrFormalRead(request) == expected.originalStopRequest && hrFormalRead(marker) == original
+                        let noBusiness = !exists(ready) && !exists(home.join("business.effects")) &&
+                            !exists(home.join("new.ready.initializations.jsonl"))
+                        let noGeneration = Directory.readFrom(generationRoot).size == 1
+                        let refused = code == 0 && !competitor.isAlive() &&
+                            !gatewayServeStopPidAlive(competitor.pid) && refusal && oldFilesUnchanged && noBusiness && noGeneration
+                        let proof = JsonObject()
+                        proof.put("phase", JsonString("after_archive_before_retirement"))
+                        proof.put("oldPid", old.pid.toJsonValue())
+                        proof.put("competitorPid", competitor.pid.toJsonValue())
+                        proof.put("competitorExit", code.toJsonValue())
+                        proof.put("claimCompetitorElapsedMs", heldMs.toJsonValue())
+                        proof.put("sharedDeadlineRemainingMs", (deadline - MonoTime.now()).toMilliseconds().toJsonValue())
+                        proof.put("competitorReaped", reaped.toJsonValue())
+                        proof.put("competitorRefused", refused.toJsonValue())
+                        proof.put("oldFilesUnchanged", oldFilesUnchanged.toJsonValue())
+                        proof.put("noNewGeneration", noGeneration.toJsonValue())
+                        proof.put("noBusiness", noBusiness.toJsonValue())
+                        File.writeTo(home.join("b2-archive-window-proof.json"), proof.toJsonString().toArray())
+                        @Expect(code, 0)
+                        @Expect(refused, true)
+                        @Expect(File.readFrom(lock), originalLock)
+                        @Expect(File.readFrom(request), originalRequest)
+                        @Expect(File.readFrom(marker), originalCompletion)
+                        @Expect(Directory.readFrom(inventory).size, inventoryFiles.size)
+                        for ((name, bytes) in inventoryFiles) { @Expect(File.readFrom(inventory.join(name)), bytes) }
+                        hrFormalAssertInterruptedArchive(home, expected)
+                        if (!refused) { throw Exception("hr_b2_claim_competitor_not_refused") }
+                        @Assert(MonoTime.now() < deadline, true)
+                    } catch (failure: Exception) { bodyFailure = Some(failure) }
+                    finally {
+                        // Failed hook cleanup is a separate original per-handle2s allowance, not a renewed commit deadline.
+                        let cleanupDeadline = MonoTime.now() + Duration.second * 2
+                        try {
+                            let proof = JsonObject()
+                            proof.put("phase", JsonString("hook_before_fallback"))
+                            proof.put("formalBeforeReaper", true.toJsonValue())
+                            proof.put("launchPending", launchPending.toJsonValue())
+                            proof.put("launchReturned", held.isSome().toJsonValue())
+                            proof.put("reapedBeforeFallback", reaped.toJsonValue())
+                            proof.put("bodyFailed", bodyFailure.isSome().toJsonValue())
+                            proof.put("oldLockPresent", exists(lock).toJsonValue())
+                            proof.put("oldRequestPresent", exists(request).toJsonValue())
+                            proof.put("oldCompletionPresent", exists(marker).toJsonValue())
+                            File.writeTo(home.join("b2-hook-before-fallback.json"), proof.toJsonString().toArray())
+                        } catch (failure: Exception) { if (bodyFailure.isNone()) { bodyFailure = Some(failure) } }
+                        match (held) {
+                            case Some(process) =>
+                                if (!reaped) {
+                                    try { if (process.isAlive()) { process.terminate(force: true) } }
+                                    catch (failure: Exception) { if (bodyFailure.isNone()) { bodyFailure = Some(failure) } }
+                                    try {
+                                        let remaining = cleanupDeadline - MonoTime.now()
+                                        if (remaining <= Duration.Zero) { throw Exception("hr_b2_hook_cleanup_pending") }
+                                        let _ = process.wait(timeout: Some(remaining))
+                                        reaped = true
+                                    } catch (failure: Exception) { if (bodyFailure.isNone()) { bodyFailure = Some(failure) } }
+                                }
+                            case None => ()
+                        }
+                        if ((launchPending || (held.isSome() && !reaped) || MonoTime.now() > cleanupDeadline) && bodyFailure.isNone()) {
+                            bodyFailure = Some(Exception("hr_b2_hook_cleanup_pending"))
+                        }
+                        if (let Some(failure) <- bodyFailure) { throw failure }
+                    }
+                })
+                @Expect(hooks.load(), 1)
+                @Assert(recovered.ok, true)
+                @Expect(recovered.status, "recovered_after_crash")
+                @Expect(exists(lock), false)
+                @Expect(exists(request), false)
+                @Expect(exists(marker), false)
+                hrFormalAssertInterruptedArchive(home, expected)
+                // Preserve the7-argument business configuration and start exactly one new generation.
+                let first = formal.launchGateway(directServe: true)
+                formal.awaitReady(first, ready)
+                @Expect(first.pid != old.pid, true)
                 let locked = hrFormalRead(lock)
                 @Expect(gatewayParseServeIdentity(locked).getOrThrow().pid, first.pid)
-                @Expect(hrFormalRead(marker), original)
-                @Expect(hrFormalArchiveOriginals(home), [original])
-                @Expect(exists(home.join("business.effects")), false)
+                @Expect(Directory.readFrom(generationRoot).size, 2)
                 let competingAt = MonoTime.now()
                 let second = formal.launchGateway(directServe: true)
                 @Expect(second.wait(timeout: Some(Duration.second * 2)), 0)
@@ -2932,24 +3411,13 @@ public class GatewayServeLockLogicTest {
                 @Expect(gatewayServeStopPidAlive(second.pid), false)
                 @Expect(hrFormalRead(formal.stdoutFiles.get(second.pid).getOrThrow()).contains("无法启动"), true)
                 @Expect(hrFormalRead(lock), locked)
-                @Expect(hrFormalRead(marker), original)
-                @Expect(hrFormalArchiveOriginals(home), [original])
-                @Expect(exists(ready), false)
-                @Expect(first.isAlive(), true)
-                // End only this injection. The in-flight forwarder still runs
-                // real lsof; later host shell probes resolve the system binary.
-                remove(bin.join("lsof"))
-                File.writeTo(release, "release\n".toArray())
-                let competingMs = (MonoTime.now() - competingAt).toMilliseconds()
-                let heldMs = DateTime.now().toUnixTimeStamp().toMilliseconds() - hrFormalNumber(entered, "enteredAtMs")
-                @Expect(competingMs < 500, true)
-                @Expect(heldMs >= 0 && heldMs < 500, true)
-                println("historical recovery archive window: enteredToReleaseMs=${heldMs}, competingMs=${competingMs}")
-                formal.awaitReady(first, ready)
-                @Expect(first.pid != old.pid, true)
-                @Expect(hrFormalRead(lock), locked)
                 @Expect(exists(marker), false)
-                @Expect(hrFormalArchiveOriginals(home), [original])
+                @Expect(Directory.readFrom(generationRoot).size, 2)
+                @Expect(first.isAlive(), true)
+                let competingMs = (MonoTime.now() - competingAt).toMilliseconds()
+                @Expect(competingMs < 500, true)
+                println("historical recovery live-lock competition: competingMs=${competingMs}")
+                hrFormalAssertInterruptedArchive(home, expected)
                 formal.assertJournal(Path(ready.toString() + ".initializations.jsonl"), hrFormalNumber(ready, "pid"))
                 hrFormalBusinessProof(home, business)
                 let final = formal.stopCurrent(0)
@@ -2961,11 +3429,7 @@ public class GatewayServeLockLogicTest {
                 hrFormalBusinessProof(home, business)
                 hrFormalAssertAllLeasesStopped(home)
                 formal.assertClean()
-            } finally {
-                hrFormalRestore("PATH", previousPath)
-                if (!exists(release)) { File.writeTo(release, "release\n".toArray()) }
-                formal.cleanup()
-            }
+            } finally { formal.cleanup() }
         })
     }
 
@@ -2997,6 +3461,25 @@ public class GatewayServeLockLogicTest {
                         @Expect(hrFormalRead(formal.stdoutFiles.get(refused.pid).getOrThrow()).contains("无法启动"), true)
                         @Expect(hrFormalRead(marker), original)
                         @Expect(hrFormalArchiveOriginals(home).size, 0)
+                    } else if (mode == "explicit-v1") {
+                        let preview = gatewayCollectCrashRecoveryEvidence(MonoTime.now() + Duration.second * 5)
+                        @Expect(preview.status, "recoverable")
+                        @Expect(preview.kind, "interrupted_shutdown")
+                        @Expect(preview.originalCompletion, Some(original))
+                        @Expect(hrFormalRead(home.join("gateway-serve.lock")), preview.originalLock)
+                        @Expect(hrFormalRead(home.join("gateway-serve.stop-request")), preview.originalStopRequest)
+                        @Expect(hrFormalRead(marker), original)
+                        let history = home.join("gateway-serve.recovery-history")
+                        let beforeCommitArchives = if (exists(history)) { Directory.readFrom(history).size } else { 0 }
+                        @Expect(beforeCommitArchives, 0)
+                        let second = formal.startService("new", directServe: true)
+                        @Expect(second.pid != first.pid, true)
+                        hrFormalAssertInterruptedArchive(home, preview)
+                        @Expect(hrFormalInterruptedArchiveOriginals(home), [original])
+                        @Expect(exists(marker), false)
+                        formal.assertJournal(home.join("new.ready.initializations.jsonl"), hrFormalNumber(home.join("new.ready"), "pid"))
+                        let final = formal.stopCurrent(0)
+                        @Expect(gatewayServeStopCompletionField(final, "fullTerminal"), "1")
                     } else {
                         @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "recoverable")
                         let second = formal.startService("new", directServe: true)
@@ -3075,21 +3558,32 @@ public class GatewayServeLockLogicTest {
 
     @TestCase
     public func hrS3P1StopPreviewRestartAndDirectServeShareRecoveryGate(): Unit {
+        let actionReturned = AtomicBool(false)
+        let cleanupAllowed = AtomicBool(false)
         hrRuntimeHome({ home, identity =>
             let original = hrRuntimeWriteMarker(identity)
             let _ = hrRuntimeWriteLease(home, identity)
             let output = ArrayList<String>()
             setGatewayStopOutputForTest(Some({ line => output.add(line) }))
-            @Expect(gatewayExecuteStopServe(), 0)
-            @Expect(String.fromUtf8(File.readFrom(home.join("gateway-serve.stop-complete"))), original)
-            @Expect(gatewayExecuteRestartServe(launchServe: { => gatewayAcquireServeLockForRunningProcess() }), 0)
-            @Expect(gatewayPeekServeLockPid().getOrThrow() != identity.pid, true)
-            @Expect(exists(home.join("gateway-serve.stop-complete")), false)
-            gatewayReleaseServeLockQuiet()
-            let _ = hrRuntimeWriteMarker(identity)
-            @Expect(gatewayAcquireServeLockForRunningProcess(), true)
-            @Expect(exists(home.join("gateway-serve.stop-complete")), false)
-        })
+            @Assert(gatewayExecuteStopServe(), 0)
+            @Assert(String.fromUtf8(File.readFrom(home.join("gateway-serve.stop-complete"))), original)
+            let synthetic = HrRuntimeSyntheticReadyServe()
+            try {
+                @Assert(gatewayExecuteRestartServe(launchServe: { => synthetic.start() }), 0)
+                @Assert(gatewayPeekServeLockPid().getOrThrow() != identity.pid, true)
+                @Assert(exists(home.join("gateway-serve.stop-complete")), false)
+                @Assert(synthetic.finish(), true)
+                gatewayReleaseServeLockQuiet()
+                let _ = hrRuntimeWriteMarker(identity)
+                @Assert(gatewayAcquireServeLockForRunningProcess(), true)
+                @Assert(exists(home.join("gateway-serve.stop-complete")), false)
+                actionReturned.store(true)
+            } finally {
+                let finished = synthetic.finish()
+                cleanupAllowed.store(actionReturned.load() && finished && synthetic.cleanupMayBeRemoved())
+                @Expect(finished, true)
+            }
+        }, cleanupAdmission: { => actionReturned.load() && cleanupAllowed.load() })
     }
 
     @TestCase
@@ -3368,11 +3862,11 @@ public class GatewayServeLockLogicTest {
                 }
                 @Expect(!demo.isEmpty() && !http.isEmpty(), true)
                 if (demo.isEmpty() || http.isEmpty()) { return }
-                let canvasStop = demo.indexOf("GatewayCanvasHostRuntime.stopDetailed(phaseDeadline)")
+                let canvasStop = demo.indexOf("shutdownOwners.run(\"canvas\", phaseDeadline, { => GatewayCanvasHostRuntime.stopDetailed(phaseDeadline) })")
                 let canvasDone = demo.indexOf("gatewayPublishShutdownPhaseForTest(identity, \"canvas_done\")")
-                let httpStop = demo.indexOf("GatewayHttpSurface.stopDetailed(phaseDeadline, shutdownIdentity: serveIdentity)")
+                let httpStop = demo.indexOf("shutdownOwners.run(\"http\", phaseDeadline, { =>")
                 let gatewayStop = demo.indexOf("gatewayPublishShutdownPhaseForTest(identity, \"gateway_stop_enter\")")
-                let observerCall = demo.indexOf("gateway.stop(deadline: shutdownDeadline, shutdownObserver: shutdownObserver)")
+                let observerCall = demo.indexOf("service.stop(deadline: shutdownDeadline, shutdownObserver: shutdownObserver)")
                 let gatewayReturned = demo.indexOf("gatewayPublishShutdownPhaseForTest(identity, \"gateway_stop_returned\")")
                 @Expect(canvasStop.isSome() && canvasDone.isSome() && httpStop.isSome() && gatewayStop.isSome() &&
                     observerCall.isSome() && gatewayReturned.isSome(), true)
@@ -4206,7 +4700,7 @@ public class GatewayServeLockLogicTest {
     @TestCase
     public func s4P1FormalGatewayStopClosesFakeGatewayAndGcmResources(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
-            let home = Path("/tmp/metis-s4-stop-e2e-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            let home = gatewayServeStopCreateCanonicalTestHome(Path("/tmp/metis-s4-stop-e2e-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"))
             let gatewayPort = gatewayServeStopTemporaryPort()
             let pluginPort = gatewayServeStopTemporaryPort()
             let descendantPort = gatewayServeStopTemporaryPort()
@@ -4245,7 +4739,6 @@ public class GatewayServeLockLogicTest {
                 @Expect(parentSetupReset.ok, true)
                 let parentSetupStopped = gatewayHeartbeatBrokerIsFullyStopped()
                 if (!parentSetupReset.ok || !parentSetupStopped) { return }
-                Directory.create(home, recursive: true)
                 setVariable("METIS_HOME", home.toString())
                 let fixture = brokerScript.parent.join("metis-gateway-stop-fake-service-plugin.mjs")
                 setVariable("METIS_CJPM_ROOT", project.toString())
@@ -4303,6 +4796,7 @@ public class GatewayServeLockLogicTest {
                     brokerScript,
                     fixtureCopy,
                     ready,
+                    gatewayPort,
                     10000
                 )
                 @Expect(ownedResources.brokerStarted, true)
@@ -4598,7 +5092,7 @@ public class GatewayServeLockLogicTest {
     @TestCase
     public func heartbeatE2eHb01TwoGenerationsSurviveProbeTimeoutAndStopTerminal(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
-            let home = Path("/tmp/metis-heartbeat-e2e-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            let home = gatewayServeStopCreateCanonicalTestHome(Path("/tmp/metis-heartbeat-e2e-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"))
             let gatewayPort = gatewayServeStopTemporaryPort()
             let webhookPort = gatewayServeStopTemporaryPort()
             @Expect(gatewayPort > 0 && webhookPort > 0 && gatewayPort != webhookPort, true)
@@ -4641,7 +5135,13 @@ public class GatewayServeLockLogicTest {
             var firstIdentity = None<GatewayServeIdentity>
             var businessEntered = false
             var allTerminal = false
+            let retainEvidence = getVariable("METIS_GATEWAY_FORMAL_RETAIN_EVIDENCE") == Some("1")
             try {
+                if (retainEvidence) {
+                    File.writeTo(home.join("gateway-formal-retained.owner"),
+                        "metis-gateway-formal-retained-v1\ntestPid:${getProcessId()}\nname:heartbeat-e2e\n".toArray())
+                    println("gateway_formal_evidence basename=${home.fileName}")
+                }
                 for (key in brokerEnvironmentKeys) { setVariable(key, "") }
                 let parentSetupReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
                 @Expect(parentSetupReset.ok, true)
@@ -4662,6 +5162,7 @@ public class GatewayServeLockLogicTest {
                     launchWrapper,
                     ("#!/bin/sh\nexport DYLD_LIBRARY_PATH=\"$METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH\"\n" +
                         "export METIS_STDIO_BROKER_TEST_MODE=1\n" +
+                        "export METIS_TEST_STDIO_BROKER_RECOVERY_DIAGNOSTICS_ONLY=1\n" +
                         "export METIS_STDIO_BROKER_DIAGNOSTIC_MARKER=\"$METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER\"\n" +
                         "export METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_MODE=1\n" +
                         "export METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_NONCE=heartbeat-e2e-v1\n" +
@@ -4736,7 +5237,7 @@ public class GatewayServeLockLogicTest {
                     let stableGatewayPid = gatewayPid
                     let processCapture = GatewayS5P1Capture()
                     @Expect(gatewayServeStopWaitUntil(15000, { =>
-                        processCapture.brokerPid = gatewayServeStopChildPid(stableGatewayPid, brokerScript.toString())
+                        processCapture.brokerPid = gatewayServeStopFramedBrokerPid(stableGatewayPid, brokerScript, "http://127.0.0.1:${gatewayPort}/readyz")
                         processCapture.brokerPid > 0 &&
                             gatewayServeStopParentPid(processCapture.brokerPid) == stableGatewayPid
                     }), true)
@@ -4974,10 +5475,12 @@ public class GatewayServeLockLogicTest {
                 CliConfig.invalidatePathCache()
                 MetisConfigManager.invalidate()
                 CliSettingManager.invalidate()
-                try { remove(home, recursive: true) } catch (_: Exception) { () }
+                if (!retainEvidence) {
+                    try { remove(home, recursive: true) } catch (_: Exception) { () }
+                }
                 @Expect(dependenciesStopped, true)
                 if (businessEntered) { @Expect(allTerminal, true) }
-                @Expect(exists(home), false)
+                if (!retainEvidence) { @Expect(exists(home), false) }
             }
         }
     }
@@ -4985,7 +5488,7 @@ public class GatewayServeLockLogicTest {
     @TestCase
     public func s5P1FormalGatewayGcmWebhookDeliversExactlyOnceAndStopsAllResources(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
-            let home = Path("/tmp/metis-s5-p1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            let home = gatewayServeStopCreateCanonicalTestHome(Path("/tmp/metis-s5-p1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"))
             let gatewayPort = gatewayServeStopTemporaryPort()
             let webhookPort = gatewayServeStopTemporaryPort()
             @Expect(gatewayPort > 0 && webhookPort > 0 && gatewayPort != webhookPort, true)
@@ -5038,8 +5541,13 @@ public class GatewayServeLockLogicTest {
             var gcmGroupGone = false
             var dependenciesSettled = false
             let output = ArrayList<String>()
+            let retainEvidence = getVariable("METIS_GATEWAY_FORMAL_RETAIN_EVIDENCE") == Some("1")
             try {
-                Directory.create(home, recursive: true)
+                if (retainEvidence) {
+                    File.writeTo(home.join("gateway-formal-retained.owner"),
+                        "metis-gateway-formal-retained-v1\ntestPid:${getProcessId()}\nname:s5-one-exact\n".toArray())
+                    println("gateway_formal_evidence basename=${home.fileName}")
+                }
                 setVariable("METIS_HOME", home.toString())
                 setVariable("METIS_CJPM_ROOT", project.toString())
                 CliConfig.invalidatePathCache()
@@ -5089,7 +5597,7 @@ public class GatewayServeLockLogicTest {
                 let processCapture = GatewayS5P1Capture()
                 let stableGatewayPid = gatewayPid
                 let brokerReady = gatewayServeStopWaitUntil(15000, { =>
-                    processCapture.brokerPid = gatewayServeStopChildPid(stableGatewayPid, brokerScript.toString())
+                    processCapture.brokerPid = gatewayServeStopFramedBrokerPid(stableGatewayPid, brokerScript, "http://127.0.0.1:${gatewayPort}/readyz")
                     processCapture.brokerPid > 0 &&
                         gatewayServeStopCommandContains(processCapture.brokerPid, brokerScript.toString()) &&
                         gatewayServeStopParentPid(processCapture.brokerPid) == stableGatewayPid
@@ -5265,7 +5773,7 @@ public class GatewayServeLockLogicTest {
                 CliConfig.invalidatePathCache()
                 MetisConfigManager.invalidate()
                 CliSettingManager.invalidate()
-                try { remove(home, recursive: true) } catch (_: Exception) { () }
+                if (!retainEvidence) { try { remove(home, recursive: true) } catch (_: Exception) { () } }
                 @Expect(gatewaySettled, true)
                 @Expect(brokerGone, true)
                 @Expect(gcmGone, true)
@@ -5278,7 +5786,7 @@ public class GatewayServeLockLogicTest {
     @TestCase
     public func s5P1Formal140BurstDrainsExactlyOnceAndStopsTerminal(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
-            let home = Path("/tmp/metis-s5-p1-140-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            let home = gatewayServeStopCreateCanonicalTestHome(Path("/tmp/metis-s5-p1-140-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"))
             let gatewayPort = gatewayServeStopTemporaryPort()
             let webhookPort = gatewayServeStopTemporaryPort()
             @Expect(gatewayPort > 0 && webhookPort > 0 && gatewayPort != webhookPort, true)
@@ -5331,8 +5839,13 @@ public class GatewayServeLockLogicTest {
             var dependenciesSettled = false
             var feishuDependenciesSettled = false
             let output = ArrayList<String>()
+            let retainEvidence = getVariable("METIS_GATEWAY_FORMAL_RETAIN_EVIDENCE") == Some("1")
             try {
-                Directory.create(home, recursive: true)
+                if (retainEvidence) {
+                    File.writeTo(home.join("gateway-formal-retained.owner"),
+                        "metis-gateway-formal-retained-v1\ntestPid:${getProcessId()}\nname:s5-140-burst\n".toArray())
+                    println("gateway_formal_evidence basename=${home.fileName}")
+                }
                 setVariable("METIS_HOME", home.toString())
                 setVariable("METIS_CJPM_ROOT", project.toString())
                 CliConfig.invalidatePathCache()
@@ -5392,7 +5905,7 @@ public class GatewayServeLockLogicTest {
                 let processCapture = GatewayS5P1Capture()
                 let stableGatewayPid = gatewayPid
                 @Expect(gatewayServeStopWaitUntil(15000, { =>
-                    processCapture.brokerPid = gatewayServeStopChildPid(stableGatewayPid, brokerScript.toString())
+                    processCapture.brokerPid = gatewayServeStopFramedBrokerPid(stableGatewayPid, brokerScript, "http://127.0.0.1:${gatewayPort}/readyz")
                     processCapture.brokerPid > 0 &&
                         gatewayServeStopCommandContains(processCapture.brokerPid, brokerScript.toString()) &&
                         gatewayServeStopParentPid(processCapture.brokerPid) == stableGatewayPid
@@ -5603,7 +6116,9 @@ public class GatewayServeLockLogicTest {
                 CliConfig.invalidatePathCache()
                 MetisConfigManager.invalidate()
                 CliSettingManager.invalidate()
-                try { remove(home, recursive: true) } catch (_: Exception) { () }
+                if (!retainEvidence) {
+                    try { remove(home, recursive: true) } catch (_: Exception) { () }
+                }
                 @Expect(gatewaySettled, true)
                 @Expect(brokerGone, true)
                 @Expect(gcmGone, true)
@@ -5617,7 +6132,7 @@ public class GatewayServeLockLogicTest {
     @TestCase
     public func s5N1FormalDroppedCompletionRecoversSameDeliveryWithoutRepeatingEffects(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
-            let home = Path("/tmp/metis-s5-n1-dropped-completion-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            let home = gatewayServeStopCreateCanonicalTestHome(Path("/tmp/metis-s5-n1-dropped-completion-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"))
             let gatewayPort = gatewayServeStopTemporaryPort()
             let webhookPort = gatewayServeStopTemporaryPort()
             @Expect(gatewayPort > 0 && webhookPort > 0 && gatewayPort != webhookPort, true)
@@ -5676,8 +6191,13 @@ public class GatewayServeLockLogicTest {
             var oldGatewayIdentity = None<GatewayServeIdentity>
             var replacementGatewayIdentity = None<GatewayServeIdentity>
             let stopOutput = ArrayList<String>()
+            let retainEvidence = getVariable("METIS_GATEWAY_FORMAL_RETAIN_EVIDENCE") == Some("1")
             try {
-                Directory.create(home, recursive: true)
+                if (retainEvidence) {
+                    File.writeTo(home.join("gateway-formal-retained.owner"),
+                        "metis-gateway-formal-retained-v1\ntestPid:${getProcessId()}\nname:s5-dropped-completion\n".toArray())
+                    println("gateway_formal_evidence basename=${home.fileName}")
+                }
                 @Expect(exists(metisBinary), true)
                 @Expect(exists(gcmSource), true)
                 @Expect(exists(proxySource), true)
@@ -5774,7 +6294,11 @@ public class GatewayServeLockLogicTest {
                 @Expect(oldHelloBrokerPid, oldBrokerPid)
                 @Expect(oldBrokerGeneration > 0, true)
                 @Expect(gatewayServeStopParentPid(oldProxyPid), oldGatewayPid)
-                @Expect(gatewayServeStopParentPid(oldBrokerPid), oldProxyPid)
+                @Expect(oldProxyPid, oldBrokerPid)
+                @Expect(gatewayServeStopParentPid(oldBrokerPid), oldGatewayPid)
+                @Expect(oldOwner.brokerPid, oldBrokerPid)
+                @Expect(oldOwner.brokerGeneration, oldBrokerGeneration)
+                @Expect(gatewayServeStopFramedBrokerPid(oldGatewayPid, brokerScript, readyzUrl), oldBrokerPid)
                 @Expect(gatewayServeStopParentPid(oldGcmPid), oldBrokerPid)
                 @Expect(gatewayServeStopProcessGroup(oldGcmPid), oldGcmPgid)
                 let oldLeaseReady = gatewayServeStopWaitUntil(5000, { =>
@@ -5919,7 +6443,7 @@ public class GatewayServeLockLogicTest {
                 let replacementOwner = GatewayServeStopLiveOwnerProof()
                 let stableReplacementGatewayPid = replacementGatewayPid
                 let replacementReady = gatewayServeStopWaitUntil(15000, { =>
-                    replacementCapture.brokerPid = gatewayServeStopChildPid(stableReplacementGatewayPid, brokerScript.toString())
+                    replacementCapture.brokerPid = gatewayServeStopFramedBrokerPid(stableReplacementGatewayPid, brokerScript, readyzUrl)
                     replacementCapture.gcmPid = gatewayServeStopChildPid(replacementCapture.brokerPid, gcmBinary.toString())
                     replacementCapture.gcmPgid = gatewayServeStopProcessGroup(replacementCapture.gcmPid)
                     replacementOwner.refresh(readyzUrl)
@@ -6113,7 +6637,9 @@ public class GatewayServeLockLogicTest {
                 CliConfig.invalidatePathCache()
                 MetisConfigManager.invalidate()
                 CliSettingManager.invalidate()
-                try { remove(home, recursive: true) } catch (_: Exception) { () }
+                if (!retainEvidence) {
+                    try { remove(home, recursive: true) } catch (_: Exception) { () }
+                }
             }
         }
     }
@@ -6122,8 +6648,8 @@ public class GatewayServeLockLogicTest {
     public func s5N1FormalGatewayWriterFailureReapsOldGenerationAndReplacementNeverReplays(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
             let suffix = DateTime.now().toUnixTimeStamp().toNanoseconds()
-            let oldHome = Path("/tmp/metis-s5-n1-old-${suffix}")
-            let replacementHome = Path("/tmp/metis-s5-n1-new-${suffix}")
+            let oldHome = gatewayServeStopCreateCanonicalTestHome(Path("/tmp/metis-s5-n1-old-${suffix}"))
+            let replacementHome = gatewayServeStopCreateCanonicalTestHome(Path("/tmp/metis-s5-n1-new-${suffix}"))
             let previousHome = getVariable("METIS_HOME")
             let previousRoot = getVariable("METIS_CJPM_ROOT")
             let environmentKeys = [
@@ -6197,12 +6723,18 @@ public class GatewayServeLockLogicTest {
             var replacementBusinessTruth = false
             var parentBrokerDiagnosticTruth = false
             let output = ArrayList<String>()
+            let retainEvidence = getVariable("METIS_GATEWAY_FORMAL_RETAIN_EVIDENCE") == Some("1")
             try {
+                if (retainEvidence) {
+                    for ((retainedHome, retainedName) in [(oldHome, "s5-writer-old"), (replacementHome, "s5-writer-replacement")]) {
+                        File.writeTo(retainedHome.join("gateway-formal-retained.owner"),
+                            "metis-gateway-formal-retained-v1\ntestPid:${getProcessId()}\nname:${retainedName}\n".toArray())
+                        println("gateway_formal_evidence basename=${retainedHome.fileName}")
+                    }
+                }
                 let parentSetupReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
                 @Expect(parentSetupReset.ok, true)
                 if (!parentSetupReset.ok) { return }
-                Directory.create(oldHome, recursive: true)
-                Directory.create(replacementHome, recursive: true)
                 @Expect(exists(metisBinary), true)
                 @Expect(exists(gcmSource), true)
                 @Expect(exists(wrapperSource), true)
@@ -6308,7 +6840,9 @@ public class GatewayServeLockLogicTest {
                 oldPgid = gatewayS5JsonInt(wrapperReady, "pgid")
                 @Expect(oldProxyPid > 1 && gatewayServeStopParentPid(oldProxyPid) == oldGatewayPid, true)
                 @Expect(gatewayServeStopCommandContains(oldProxyPid, proxy.toString()), true)
-                @Expect(oldBrokerPid > 1 && gatewayServeStopParentPid(oldBrokerPid) == oldProxyPid, true)
+                @Expect(oldBrokerPid > 1 && gatewayServeStopParentPid(oldBrokerPid) == oldGatewayPid, true)
+                @Expect(oldProxyPid, oldBrokerPid)
+                @Expect(gatewayS5JsonInt(proxyReady, "helloBrokerPid"), oldBrokerPid)
                 @Expect(oldServiceOwnerId.isEmpty(), false)
                 @Expect(oldServiceGeneration > 0, true)
                 @Expect(gatewayServeStopCommandContains(oldBrokerPid, brokerScript.toString()), true)
@@ -6322,6 +6856,9 @@ public class GatewayServeLockLogicTest {
                     oldOwnerProof.refresh(oldReadyz)
                     oldOwnerProof.httpStatus == 200 && oldOwnerProof.running && oldOwnerProof.ownerCount >= 1
                 }), true)
+                @Expect(oldOwnerProof.brokerPid, oldBrokerPid)
+                @Expect(oldOwnerProof.brokerGeneration, oldServiceGeneration)
+                @Expect(gatewayServeStopFramedBrokerPid(oldGatewayPid, brokerScript, oldReadyz), oldBrokerPid)
                 let oldDelivery = "s5-n1-old"
                 let oldWebhookStatus = gatewayS5PostWebhook(oldWebhookPort, oldDelivery)
                 @Expect(oldWebhookStatus >= 200 && oldWebhookStatus < 300, true)
@@ -6389,6 +6926,7 @@ public class GatewayServeLockLogicTest {
                 }
                 setGatewayStopOutputForTest(Some({ line => output.add(line) }))
                 let expectedOldIdentity = oldIdentity.getOrThrow()
+                let originalOldLockBytes = File.readFrom(oldLockPath)
                 let expectedStopRequestPath = oldStopRequestPath
                 let expectedHoldRelease = holdRelease
                 let expectedHoldReleased = holdReleased
@@ -6450,7 +6988,7 @@ public class GatewayServeLockLogicTest {
                 @Expect(parentBrokerAfterStop.generation, parentBrokerBeforeStop.generation)
                 @Expect(parentBrokerAfterStop.brokerPid, parentBrokerBeforeStop.brokerPid)
                 @Expect(parentBrokerAfterStop.ownerCount, 0)
-                @Expect(oldOutput.contains("子进程清理未完成"), true)
+                @Expect(oldOutput.contains("关闭流程尚未确认所有资源终态，已保留清理记录"), true)
                 @Expect(oldOutput.contains("\"ok\""), false)
                 let oldLogPath = oldHome.join("s5-gateway.log")
                 @Expect(exists(oldLogPath), true)
@@ -6588,8 +7126,21 @@ public class GatewayServeLockLogicTest {
                 @Expect(historical.ok, false)
                 @Expect(historical.status, "resources_not_terminal")
                 @Expect(gatewayPendingServeCompletionStatus(), "cleanup_pending")
-                @Expect(exists(oldLockPath), false)
-                @Expect(exists(oldStopRequestPath), false)
+                let retainedOldLockBytes = File.readFrom(oldLockPath)
+                @Expect(retainedOldLockBytes, originalOldLockBytes)
+                @Expect(exists(oldStopRequestPath), true)
+                let retainedOldRequestBytes = File.readFrom(oldStopRequestPath)
+                let retainedOldLockBound = try {
+                    gatewayParseCrashLockStrict(String.fromUtf8(retainedOldLockBytes)).getOrThrow().matches(expectedOldIdentity)
+                } catch (_: Exception) { false }
+                let retainedOldRequestBound = try {
+                    let requestText = String.fromUtf8(retainedOldRequestBytes)
+                    !requestText.isEmpty() && gatewayParseServeStopRequestIdentity(requestText).getOrThrow().matches(expectedOldIdentity)
+                } catch (_: Exception) { false }
+                let retainedOldFacts = retainedOldLockBytes == originalOldLockBytes &&
+                    retainedOldLockBound && retainedOldRequestBound
+                @Expect(retainedOldFacts, true)
+                if (!retainedOldFacts) { throw Exception("s5_writer_pending_evidence_invalid") }
                 oldBusinessTruth = true
 
                 setGatewayStopOutputForTest(None<(String) -> Unit>)
@@ -6641,7 +7192,7 @@ public class GatewayServeLockLogicTest {
                 let replacementReadyz = "http://127.0.0.1:${replacementGatewayPort}/readyz"
                 let stableReplacementGatewayPid = replacementGatewayPid
                 @Expect(gatewayServeStopWaitUntil(15000, { =>
-                    replacementCapture.brokerPid = gatewayServeStopChildPid(stableReplacementGatewayPid, brokerScript.toString())
+                    replacementCapture.brokerPid = gatewayServeStopFramedBrokerPid(stableReplacementGatewayPid, brokerScript, replacementReadyz)
                     replacementCapture.gcmPid = gatewayServeStopChildPid(replacementCapture.brokerPid, replacementGcm.toString())
                     replacementCapture.gcmPgid = gatewayServeStopProcessGroup(replacementCapture.gcmPid)
                     replacementOwnerProof.refresh(replacementReadyz)
@@ -6820,8 +7371,12 @@ public class GatewayServeLockLogicTest {
                 CliConfig.invalidatePathCache()
                 MetisConfigManager.invalidate()
                 CliSettingManager.invalidate()
-                try { remove(oldHome, recursive: true) } catch (_: Exception) { () }
-                try { remove(replacementHome, recursive: true) } catch (_: Exception) { () }
+                if (!retainEvidence) {
+                    try { remove(oldHome, recursive: true) } catch (_: Exception) { () }
+                }
+                if (!retainEvidence) {
+                    try { remove(replacementHome, recursive: true) } catch (_: Exception) { () }
+                }
                 @Expect(oldBusinessTruth, true)
                 @Expect(replacementBusinessTruth, true)
                 @Expect(oldGatewaySettled, true)
@@ -6856,8 +7411,8 @@ public class GatewayServeLockLogicTest {
     public func s4N1FormalGatewayStopReapsIgnoreTermTreeAndRejectsStaleIdentity(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
             let suffix = DateTime.now().toUnixTimeStamp().toNanoseconds()
-            let ignoreHome = Path("/tmp/metis-s4-stop-negative-ignore-${suffix}")
-            let replacementHome = Path("/tmp/metis-s4-stop-negative-replacement-${suffix}")
+            let ignoreHome = gatewayServeStopCreateCanonicalTestHome(Path("/tmp/metis-s4-stop-negative-ignore-${suffix}"))
+            let replacementHome = gatewayServeStopCreateCanonicalTestHome(Path("/tmp/metis-s4-stop-negative-replacement-${suffix}"))
             let oldHome = getVariable("METIS_HOME")
             let oldRoot = getVariable("METIS_CJPM_ROOT")
             let brokerScript = Path(managedStdioResolveBrokerScriptPath())
@@ -6890,8 +7445,15 @@ public class GatewayServeLockLogicTest {
             var ignoreResources = GatewayServeStopResourceCapture()
             var oldResources = GatewayServeStopResourceCapture()
             var replacementResources = GatewayServeStopResourceCapture()
+            let retainEvidence = getVariable("METIS_GATEWAY_FORMAL_RETAIN_EVIDENCE") == Some("1")
             try {
-                Directory.create(ignoreHome, recursive: true)
+                if (retainEvidence) {
+                    for ((retainedHome, retainedName) in [(ignoreHome, "s4-ignore-term"), (replacementHome, "s4-replacement")]) {
+                        File.writeTo(retainedHome.join("gateway-formal-retained.owner"),
+                            "metis-gateway-formal-retained-v1\ntestPid:${getProcessId()}\nname:${retainedName}\n".toArray())
+                        println("gateway_formal_evidence basename=${retainedHome.fileName}")
+                    }
+                }
                 setVariable("METIS_HOME", ignoreHome.toString())
                 setVariable("METIS_CJPM_ROOT", project.toString())
                 CliConfig.invalidatePathCache()
@@ -6920,6 +7482,7 @@ public class GatewayServeLockLogicTest {
                     brokerScript,
                     ignoreHome.join("metis-gateway-stop-fake-service-plugin.mjs"),
                     ignoreReady,
+                    ignoreGatewayPort,
                     10000
                 )
                 @Expect(ignoreResources.brokerStarted, true)
@@ -6965,7 +7528,7 @@ public class GatewayServeLockLogicTest {
                 setGatewayStopOutputForTest(Some({ line => ignoreOutput.add(line) }))
                 @Expect(gatewayExecuteStopServe(), 1)
                 setGatewayStopOutputForTest(None<(String) -> Unit>)
-                @Expect(String.join(ignoreOutput.toArray(), delimiter: "\n").contains("子进程清理未完成"), true)
+                @Expect(String.join(ignoreOutput.toArray(), delimiter: "\n").contains("关闭流程尚未确认所有资源终态，已保留清理记录"), true)
                 let ignoreLeaseStopped = try {
                     String.fromUtf8(File.readFrom(ignoreLease)).contains("\"state\":\"stopped\"")
                 } catch (_: Exception) {
@@ -6981,9 +7544,17 @@ public class GatewayServeLockLogicTest {
                 @Expect(gatewayParseServeIdentity(ignoreCompletion).getOrThrow().matches(ignoreIdentity), true)
                 @Expect(gatewayServeStopCompletionField(ignoreCompletion, "status"), "cleanup_pending")
                 @Expect(gatewayServeStopCompletionField(ignoreCompletion, "fullTerminal"), "0")
-                @Expect(exists(ignoreHome.join("gateway-serve.lock")), false)
-                @Expect(exists(ignoreHome.join("gateway-serve.stop-request")), false)
-                @Expect(gatewayAcquireServeLockForRunningProcess(), false)
+                @Expect(File.readFrom(ignoreHome.join("gateway-serve.lock")), ignoreLockText.toArray())
+                let ignoreRequestPath = ignoreHome.join("gateway-serve.stop-request")
+                @Expect(exists(ignoreRequestPath), true)
+                let ignoreRequestBytes = File.readFrom(ignoreRequestPath)
+                let ignoreRequest = try { String.fromUtf8(ignoreRequestBytes) } catch (_: Exception) { "" }
+                @Expect(ignoreRequest.isEmpty(), false)
+                @Expect(gatewayParseServeStopRequestIdentity(ignoreRequest).getOrThrow().matches(ignoreIdentity), true)
+                // Preserve the stop-boundary bytes without attempting a new generation admission.
+                @Expect(File.readFrom(ignoreHome.join("gateway-serve.lock")), ignoreLockText.toArray())
+                @Expect(File.readFrom(ignoreRequestPath), ignoreRequestBytes)
+                @Expect(File.readFrom(ignoreCompletionPath), ignoreCompletion.toArray())
                 @Expect(exists(ignoreCompletionPath), true)
                 let ignoreGatewayReaped = gatewayServeStopReapCompletedOwnedProcess(ignoreProcess)
                 @Expect(ignoreGatewayReaped, true)
@@ -6998,7 +7569,6 @@ public class GatewayServeLockLogicTest {
                 }), true)
                 @Expect(executeWithOutput("/usr/bin/pgrep", ["-g", "${ignorePgid}"])[0] != 0, true)
 
-                Directory.create(replacementHome, recursive: true)
                 setVariable("METIS_HOME", replacementHome.toString())
                 CliConfig.invalidatePathCache()
                 MetisConfigManager.invalidate()
@@ -7026,6 +7596,7 @@ public class GatewayServeLockLogicTest {
                     brokerScript,
                     replacementHome.join("metis-gateway-stop-fake-service-plugin.mjs"),
                     oldReady,
+                    replacementGatewayPort,
                     10000
                 )
                 @Expect(oldResources.brokerStarted, true)
@@ -7110,6 +7681,7 @@ public class GatewayServeLockLogicTest {
                     brokerScript,
                     replacementHome.join("metis-gateway-stop-fake-service-plugin.mjs"),
                     replacementReady,
+                    replacementGatewayPort,
                     10000
                 )
                 @Expect(replacementResources.brokerStarted, true)
@@ -7278,8 +7850,12 @@ public class GatewayServeLockLogicTest {
                 CliConfig.invalidatePathCache()
                 MetisConfigManager.invalidate()
                 CliSettingManager.invalidate()
-                try { remove(ignoreHome, recursive: true) } catch (_: Exception) { () }
-                try { remove(replacementHome, recursive: true) } catch (_: Exception) { () }
+                if (!retainEvidence) {
+                    try { remove(ignoreHome, recursive: true) } catch (_: Exception) { () }
+                }
+                if (!retainEvidence) {
+                    try { remove(replacementHome, recursive: true) } catch (_: Exception) { () }
+                }
                 @Expect(replacementGatewaySettled, true)
                 @Expect(oldGatewaySettled, true)
                 @Expect(ignoreGatewaySettled, true)
@@ -7295,6 +7871,42 @@ public class GatewayServeLockLogicTest {
                 @Expect(replacementFixtureStatus, "gone")
                 @Expect(oldFixtureStatus, "gone")
                 @Expect(ignoreFixtureStatus, "gone")
+            }
+        }
+    }
+}
+
+@When[os == "macOS"]
+@Test
+public class GatewayInternalArtifactTest {
+    @TestCase
+    public func gwArtU1ExplicitPortProbeKeepsIndependentContract(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = Directory.createTemp("/private/tmp")
+            let client = ManagedStdioBrokerClient(brokerScriptPath: home.join("missing 中文😀.mjs").toString())
+            let calls = AtomicInt64(0)
+            let priorProvider = debugSetShellBrokerProviderForTest(Some({ => client }))
+            let priorProbe = setGatewayServePortProbeForTest(Some({ _port: Int64, _budget: Int64 =>
+                calls.fetchAdd(1); (1, "", "")
+            }))
+            var formal = false
+            try {
+                let overridden = gatewayServePortProbeInternalArtifactsValid()
+                @Expect(overridden, true)
+                let _ = setGatewayServePortProbeForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+                let missing = gatewayServePortProbeInternalArtifactsValid()
+                @Expect(missing, false)
+                @Expect(calls.load(), 0)
+                let state = client.snapshot()
+                let unused = state.generation == 0 && !state.running && state.brokerPid == 0 && state.ownerCount == 0 &&
+                    state.readerCount == 0 && state.dispatcherCount == 0
+                @Expect(unused, true)
+                formal = overridden && !missing && calls.load() == 0 && unused
+            } finally {
+                let _ = setGatewayServePortProbeForTest(priorProbe)
+                let _ = debugSetShellBrokerProviderForTest(priorProvider)
+                File.writeTo(home.join("formal-before-cleanup"), ("formal:${formal}\nno_process:true\n").toArray())
+                if (formal) { remove(home, recursive: true) }
             }
         }
     }

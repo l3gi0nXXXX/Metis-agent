@@ -1,20 +1,138 @@
 package metis.gateway.runtime
 
 import metis.core.{gatewayClearSubagentNoticeDeliveryHook, gatewayClearSubagentNoticeEventHook, gatewayRegisterSubagentNoticeDeliveryHook}
+import metis.lsp.closeLspProcessRecoveryOwner
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisConfigWriteNotificationListener}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.gatewayPrepareStartupAuth
-import metis.gateway.core.{GatewayStopResult, gatewayLogMeta, gatewayLogProcessMemory, gatewayRuntimeHeapSnapshot}
+import metis.gateway.core.{GatewayStopResult, GatewayService, gatewayLogMeta, gatewayLogProcessMemory, gatewayRuntimeHeapSnapshot}
 import metis.gateway.logging.{MetisLogEvent, gatewayLoggingCurrentLogFile, metisCreateSubsystemLogger}
 import metis.core.memory.{DreamingPhaseRuntime, MemoryRuntime, MemoryMaintenanceStopResult}
 import metis.io.PrintUtils
-import metis.gateway.model.ChatType
+import metis.gateway.model.{ChatType, GatewayConfig}
 import metis.utils.InfoUtils
-import std.env.{getVariable, setVariable}
+import magic.utils.http.{HttpProcessLaunchProvider, HttpProcessLaunchSpec, setHttpProcessLaunchProvider}
+import metis.process.{managedRecoveryContext, managedRecoveryNativeIntent, managedRecoveryNativeSpawned,
+    managedRecoveryNativeTerminal, managedRecoveryCommitAttachedLaunch, managedRecoveryRequestOwnedHelperStop,
+    managedRecoveryRetireObservedHelper, managedRecoveryProbeRecords, managedStdioResolveBrokerScriptPath, managedStdioResolveNodeCommand,
+    managedRecoveryBindHelperParent, managedRecoveryPrepareAttachedEnvironment, managedRecoveryBinding,
+    managedRecoveryReadExecError, managedRecoveryStopOwnedChildren, ManagedMagicRecoveryLaunchScope}
+import std.collection.{ArrayList, HashMap}
+import std.fs.{FileInfo, Path, canonicalize}
+import std.env.{getVariable, getVariables, setVariable, removeVariable}
 import std.time.*
+import std.sync.Mutex
 import stdx.encoding.json.JsonObject
 
 private let gatewayServeLogger = metisCreateSubsystemLogger("gateway/runtime")
+
+/** Magic owns raw HTTP pipes; the neutral process helper owns only the external process tree. */
+class GatewayHttpRecoveryLaunchProvider <: HttpProcessLaunchProvider {
+    private let context: (String, String)
+    private let binding: String
+    private let admission = Mutex()
+    private var closing = false
+    public init(context: (String, String), binding!: ?String = None) {
+        this.context = context
+        this.binding = binding.getOrDefault({ => managedRecoveryBinding(context) })
+    }
+    public func closeAdmission(): Unit { synchronized(this.admission) { this.closing = true } }
+    public func prepare(command: String, args: Array<String>): HttpProcessLaunchSpec {
+        let context = this.context
+        var brokerScript = ""
+        let key = synchronized(this.admission) {
+            if (this.closing) { throw Exception("process_recovery_generation_closing") }
+            if (managedRecoveryBinding(context) != this.binding) { throw Exception("process_recovery_inventory_pending") }
+            brokerScript = try {
+                let configured = managedStdioResolveBrokerScriptPath()
+                if (configured.isEmpty()) { throw Exception("owned_process_internal_asset_invalid") }
+                let path = canonicalize(Path(configured))
+                if (!FileInfo(path).isRegular()) { throw Exception("owned_process_internal_asset_invalid") }
+                path.toString()
+            } catch (_: Exception) { throw Exception("owned_process_internal_asset_invalid") }
+            managedRecoveryNativeIntent(context: context)
+        }
+        try {
+        let environment = HashMap<String, String>(getVariables())
+        managedRecoveryBindHelperParent(environment)
+        environment["METIS_PROCESS_RECOVERY_DIRECTORY"] = context[0]
+        environment["METIS_PROCESS_RECOVERY_PARENT"] = context[1]
+        environment["METIS_PROCESS_RECOVERY_BROKER_KEY"] = key
+        managedRecoveryPrepareAttachedEnvironment(environment)
+        let binding = this.binding
+        let wrapped = ArrayList<String>()
+        wrapped.add(brokerScript); wrapped.add("--attached"); wrapped.add(command)
+        for (arg in args) { wrapped.add(arg) }
+        HttpProcessLaunchSpec(managedStdioResolveNodeCommand(), wrapped.toArray(),
+            environment: environment,
+            detachedProcessGroup: true,
+            onSpawned: { pid => managedRecoveryNativeSpawned(key, pid, 0, context: context) &&
+                managedRecoveryCommitAttachedLaunch(Path(context[0]), key, context[1]) },
+            requestStop: { pid, _force => managedRecoveryRequestOwnedHelperStop(pid) },
+            onTerminal: { _pid, spawned, reaped =>
+                if (!spawned) { managedRecoveryNativeTerminal(key, 0, 0, false, true, context: context) }
+                else if (reaped) {
+                    let outcome = managedRecoveryReadExecError(Path(context[0]), context[1], binding, "${key}-o-1")
+                    let original = outcome.map({ value => value.originalText }).getOrDefault({ => "" })
+                    let _ = managedRecoveryRetireObservedHelper(key, context,
+                        expectedBinding: Some(binding), expectedExecText: Some(original))
+                }
+            })
+        } catch (error: Exception) {
+            // prepare has not returned a spec: the caller cannot have spawned this resource.
+            managedRecoveryNativeTerminal(key, 0, 0, false, true, context: context)
+            throw error
+        }
+    }
+}
+
+/** A clean embedded serve restores the exact prior process context; pending workers retain a fence. */
+class GatewayRecoveryLaunchScope {
+    private let context: (String, String)
+    private let binding: String
+    private let provider: GatewayHttpRecoveryLaunchProvider
+    private let previous: ?HttpProcessLaunchProvider
+    private let magicProcesses: ManagedMagicRecoveryLaunchScope
+    private let previousDirectory: ?String
+    private let previousParent: ?String
+    private var restored = false
+    public init(context: (String, String), binding: String, previousDirectory: ?String, previousParent: ?String) {
+        this.context = context; this.binding = binding
+        this.previousDirectory = previousDirectory; this.previousParent = previousParent
+        this.provider = GatewayHttpRecoveryLaunchProvider(context, binding: Some(binding))
+        this.previous = setHttpProcessLaunchProvider(Some<HttpProcessLaunchProvider>(this.provider))
+        this.magicProcesses = ManagedMagicRecoveryLaunchScope(context)
+    }
+    public func closeAdmission(): Unit {
+        this.provider.closeAdmission()
+    }
+    public func stopOwnedChildren(deadline: MonoTime): Bool {
+        this.magicProcesses.fence()
+        let lspStopped = closeLspProcessRecoveryOwner(this.context)
+        let nativeStopped = managedRecoveryStopOwnedChildren(this.context, deadline)
+        let magicStopped = this.magicProcesses.stop(deadline)
+        let inventory = managedRecoveryProbeRecords(Path(this.context[0]), this.context[1], this.binding, deadline)
+        lspStopped && nativeStopped && magicStopped && inventory.ok && inventory.terminal
+    }
+    public func restoreAfterTerminal(deadline: MonoTime): Bool {
+        this.closeAdmission()
+        if (this.restored) { return true }
+        let proof = managedRecoveryProbeRecords(Path(this.context[0]), this.context[1], this.binding, deadline)
+        if (!proof.ok || !proof.terminal) { return false }
+        if (!this.magicProcesses.restoreAfterTerminal(deadline)) { return false }
+        let _ = setHttpProcessLaunchProvider(this.previous)
+        match (this.previousDirectory) {
+            case Some(value) => setVariable("METIS_PROCESS_RECOVERY_DIRECTORY", value)
+            case None => removeVariable("METIS_PROCESS_RECOVERY_DIRECTORY")
+        }
+        match (this.previousParent) {
+            case Some(value) => setVariable("METIS_PROCESS_RECOVERY_PARENT", value)
+            case None => removeVariable("METIS_PROCESS_RECOVERY_PARENT")
+        }
+        this.restored = true
+        true
+    }
+}
 func gatewayMemoryMaintenanceStopSurface(result: MemoryMaintenanceStopResult): GatewaySurfaceStopResult {
     // worker_failed is returned only after the worker's actual finally settled and its slot was reaped.
     let terminal = result.pendingCount == 0 && ["stopped", "already_stopped", "worker_failed"].contains(result.status)
@@ -261,6 +379,16 @@ public func runGatewayService(verbose!: Bool = false): Int64 {
         gatewayShellPrintLines(["网关总开关已关闭（metis.json 中 gateway.enabled=false）。执行：metis gateway master on"])
         return 0
     }
+    // These endpoints require the captured-command port proof during shutdown.
+    // Reject missing internal deployment files before creating a generation or listener.
+    let needsHttpPortProof = user.http.endpoints.chatCompletions.enabled || user.http.endpoints.responses.enabled ||
+        user.remote.enabled || user.controlUi.enabled
+    if (needsHttpPortProof && !gatewayServePortProbeInternalArtifactsValid()) {
+        gatewayServeLogger.error(MetisLogEvent.gatewayShutdown, "Gateway internal process artifacts are invalid",
+            meta: gatewayLogMeta().string("phase", "start").string("status", "owned_process_internal_asset_invalid").object())
+        gatewayShellPrintLines(["[网关] 内部运行文件缺失或无效，已拒绝启动。 owned_process_internal_asset_invalid"])
+        return 1
+    }
     if (!gatewayAcquireServeLockForRunningProcess()) {
         gatewayRuntimeMarkStopped(reason: "lock-not-acquired")
         gatewayServeLogger.error(MetisLogEvent.gatewayShutdown, "Gateway serve aborted because serve lock was not acquired")
@@ -268,38 +396,57 @@ public func runGatewayService(verbose!: Bool = false): Int64 {
         gatewayShellPrintLines(["[网关] 无法启动：检测到已有网关实例在运行，或锁文件 ~/.metis/gateway-serve.lock 仍有效。请先关闭旧网关窗口后再试。"])
         return 0
     }
-    gatewayRuntimeMarkStarting()
-    gatewayServeLogger.debug(MetisLogEvent.loggingRaw, "Gateway.serve: serve lock acquired, building gateway service")
-    gatewayServeTimingLog("lock-acquired", startMs)
-    let (gateway, feishu) = buildGatewayServiceFromUserSettings(user)
-    let gatewayCfg = buildGatewayConfigFromUserSettings(user)
+    let previousRecoveryDirectory = getVariable("METIS_PROCESS_RECOVERY_DIRECTORY")
+    let previousRecoveryParent = getVariable("METIS_PROCESS_RECOVERY_PARENT")
+    let recoveryIdentity = gatewayCurrentServeIdentity()
+    if (recoveryIdentity.isNone() || !gatewayInitializeRecoveryInventory(recoveryIdentity.getOrThrow())) {
+        gatewayReleaseServeLockQuiet()
+        gatewayShellPrintLines(["[网关] 无法建立历史资源所有权记录，已拒绝启动。"])
+        return 1
+    }
+    var recoveryLaunchScope = None<GatewayRecoveryLaunchScope>
+    var gatewayOwner = None<GatewayService>
+    var cronOwner = None<CronRunner>
+    var platformConfig = None<GatewayConfig>
     let serveIdentity = gatewayCurrentServeIdentity()
-    gatewayServeTimingLog("service-built", startMs)
-    gatewayRegisterActiveService(gateway)
-    gatewayRegisterSubagentNoticeDeliveryHook({ channelName, accountId, peerId, notice, replyToMessageId, replyInThread =>
-        gateway.sendTextToPeerDetailed(
-            channelName,
-            peerId,
-            notice,
-            replyToMessageId: if (replyToMessageId.trimAscii().isEmpty()) { None<String> } else { Some<String>(replyToMessageId.trimAscii()) },
-            replyInThread: replyInThread,
-            accountId: accountId
-        )
-    })
-    gatewayEnsureSubagentNoticeEventPublisherRegistered()
-    GatewayServer.startGatewayServer(options: gatewayServerOptionsFromConfig(gatewayCfg))
-    gatewayServeTimingLog("rpc-server-started", startMs)
-    let cronRunner = CronRunner(
-        gatewayOpt: Some(gateway),
-        cronEnabled: user.cronEnabled,
-        maxConcurrentRuns: user.cronMaxConcurrentRuns,
-        cronDefaultTimeoutMs: user.cronDefaultTimeoutMs,
-        cronSafetyTimeoutMs: user.cronSafetyTimeoutMs,
-        cronIdleTimeoutMs: user.cronIdleTimeoutMs
-    )
-    cronRunner.start()
-    registerGatewayCronRunHookForRunner(cronRunner)
     try {
+        recoveryLaunchScope = if (gatewayCrashRecoveryPlatformSupported()) {
+            Some(GatewayRecoveryLaunchScope(managedRecoveryContext(), recoveryIdentity.getOrThrow().nonce,
+                previousRecoveryDirectory, previousRecoveryParent))
+        } else { None<GatewayRecoveryLaunchScope> }
+        gatewayRuntimeMarkStarting()
+        gatewayServeLogger.debug(MetisLogEvent.loggingRaw, "Gateway.serve: serve lock acquired, building gateway service")
+        gatewayServeTimingLog("lock-acquired", startMs)
+        let (gateway, feishu) = buildGatewayServiceFromUserSettings(user)
+        gatewayOwner = Some(gateway)
+        let gatewayCfg = buildGatewayConfigFromUserSettings(user)
+        platformConfig = Some(gatewayCfg)
+        gatewayServeTimingLog("service-built", startMs)
+        gatewayRegisterActiveService(gateway)
+        gatewayRegisterSubagentNoticeDeliveryHook({ channelName, accountId, peerId, notice, replyToMessageId, replyInThread =>
+            gateway.sendTextToPeerDetailed(
+                channelName,
+                peerId,
+                notice,
+                replyToMessageId: if (replyToMessageId.trimAscii().isEmpty()) { None<String> } else { Some<String>(replyToMessageId.trimAscii()) },
+                replyInThread: replyInThread,
+                accountId: accountId
+            )
+        })
+        gatewayEnsureSubagentNoticeEventPublisherRegistered()
+        GatewayServer.startGatewayServer(options: gatewayServerOptionsFromConfig(gatewayCfg))
+        gatewayServeTimingLog("rpc-server-started", startMs)
+        let cronRunner = CronRunner(
+            gatewayOpt: Some(gateway),
+            cronEnabled: user.cronEnabled,
+            maxConcurrentRuns: user.cronMaxConcurrentRuns,
+            cronDefaultTimeoutMs: user.cronDefaultTimeoutMs,
+            cronSafetyTimeoutMs: user.cronSafetyTimeoutMs,
+            cronIdleTimeoutMs: user.cronIdleTimeoutMs
+        )
+        cronOwner = Some(cronRunner)
+        cronRunner.start()
+        registerGatewayCronRunHookForRunner(cronRunner)
         if (generatedAuthToken) {
             gatewayServeLogger.debug(
                 MetisLogEvent.loggingRaw,
@@ -359,6 +506,9 @@ public func runGatewayService(verbose!: Bool = false): Int64 {
         gatewayLogProcessMemory("serve:gateway_start_before")
         gateway.start()
         gatewayLogProcessMemory("serve:gateway_start_after")
+        if (serveIdentity.isNone() || !gatewayPublishServeReady(serveIdentity.getOrThrow())) {
+            throw Exception("gateway_ready_evidence_write_failed")
+        }
         gatewayRuntimeMarkRunning()
         gatewayLogProcessMemory("serve:ready")
         gatewayServeLogger.info(MetisLogEvent.gatewayReady, "Gateway serve ready")
@@ -420,14 +570,22 @@ public func runGatewayService(verbose!: Bool = false): Int64 {
             sleep(Duration.millisecond * 200)
         }
     } finally {
+        let closingCronOwner = cronOwner
+        let closingRecoveryScope = recoveryLaunchScope
+        let closingPlatformConfig = platformConfig
+        match (recoveryLaunchScope) { case Some(scope) => scope.closeAdmission() case None => () }
         gatewayLogProcessMemory("serve:stop_begin")
         let shutdownOwners = GatewayServeShutdownOwners()
         let shutdownDeadline = gatewayServeShutdownDeadline(serveIdentity)
         let phaseDeadline = shutdownDeadline - Duration.millisecond * min(2000, max(0, (shutdownDeadline - MonoTime.now()).toMilliseconds()))
         // Cron 清理仍可能需要 channel/session；必须在 Gateway teardown 前完成有界取消与收割。
         var cronStop = shutdownOwners.run("cron", phaseDeadline, { =>
-            let result = cronRunner.stop(reason: "gateway_shutdown", drainTimeoutMs: min(5000, max(0, (phaseDeadline - MonoTime.now()).toMilliseconds())))
-            GatewaySurfaceStopResult(result.drained, if (result.drained) { "stopped" } else { "cleanup_pending" })
+            match (closingCronOwner) {
+                case Some(runner) =>
+                    let result = runner.stop(reason: "gateway_shutdown", drainTimeoutMs: min(5000, max(0, (phaseDeadline - MonoTime.now()).toMilliseconds())))
+                    GatewaySurfaceStopResult(result.drained, if (result.drained) { "stopped" } else { "cleanup_pending" })
+                case None => GatewaySurfaceStopResult(true, "not_applicable")
+            }
         })
         try { MetisConfigManager.setWriteRootNotificationHook(None<MetisConfigWriteNotificationListener>) } catch (_: Exception) { () }
         // Request cancellation now; a running maintenance command may need broker close to finish.
@@ -457,7 +615,10 @@ public func runGatewayService(verbose!: Bool = false): Int64 {
                 })
                 case None => None<(String) -> Unit>
             }
-            let result = gateway.stop(deadline: shutdownDeadline, shutdownObserver: shutdownObserver)
+            let result = match (gatewayOwner) {
+                case Some(service) => service.stop(deadline: shutdownDeadline, shutdownObserver: shutdownObserver)
+                case None => GatewayStopResult(true, "stopped", channelsStatus: "not_applicable")
+            }
             match (serveIdentity) {
                 case Some(identity) => let _ = gatewayPublishShutdownPhaseForTest(identity, "gateway_stop_returned")
                 case None => ()
@@ -470,13 +631,20 @@ public func runGatewayService(verbose!: Bool = false): Int64 {
             let result = MemoryRuntime.stopActiveMaintenanceUntil(shutdownDeadline)
             gatewayMemoryMaintenanceStopSurface(result)
         })
+        let ownedProcessStop = shutdownOwners.run("owned_processes", shutdownDeadline, { =>
+            let stopped = match (closingRecoveryScope) {
+                case Some(scope) => scope.stopOwnedChildren(shutdownDeadline)
+                case None => true
+            }
+            GatewaySurfaceStopResult(stopped, if (stopped) { "stopped" } else { "cleanup_pending" })
+        })
         // Secondary persistence and reporting must never skip the actual resource closure or completion.
         let _ = shutdownOwners.run("state", shutdownDeadline, { =>
             gatewayClearActiveService()
             gatewayClearSubagentNoticeDeliveryHook()
             gatewayClearSubagentNoticeEventHook()
             gatewayResetSubagentNoticeEventPublisherRegistration()
-            try { gatewayPlatformMarkStopped(gatewayCfg) } catch (_: Exception) {
+            try { if (let Some(config) <- closingPlatformConfig) { gatewayPlatformMarkStopped(config) } } catch (_: Exception) {
                 gatewayServeLogger.error(MetisLogEvent.gatewayShutdown, "Gateway shutdown platform state persistence failed",
                     meta: gatewayLogMeta().string("phase", "state").string("step", "platform").string("status", "persistence_failed").object())
             }
@@ -491,12 +659,18 @@ public func runGatewayService(verbose!: Bool = false): Int64 {
         canvasStop = shutdownOwners.result("canvas", canvasStop)
         httpStop = shutdownOwners.result("http", httpStop)
         gatewayServerStop = shutdownOwners.result("server", gatewayServerStop)
-        let shutdownPending = shutdownOwners.reap()
+        var shutdownPending = shutdownOwners.reap() + if (ownedProcessStop.ok) { 0 } else { 1 }
         gatewayRetainPendingShutdownOwners(shutdownOwners)
+        let phasesStopped = gatewayStop.ok && cronStop.ok && memoryStop.ok && canvasStop.ok && httpStop.ok && gatewayServerStop.ok && shutdownPending == 0
+        let scopeRestored = if (phasesStopped) {
+            match (recoveryLaunchScope) { case Some(scope) => scope.restoreAfterTerminal(shutdownDeadline) case None => true }
+        } else { false }
+        if (phasesStopped && !scopeRestored) { shutdownPending += 1 }
         let shutdownPhase = if (!cronStop.ok) { "cron" } else if (!memoryStop.ok) { "memory" } else if (!canvasStop.ok) { "canvas" }
             else if (!httpStop.ok) { "http" } else if (!gatewayServerStop.ok) { "server" }
             else if (gatewayStop.channelsStatus != "stopped" && gatewayStop.channelsStatus != "not_applicable") { "channels" }
-            else if (!gatewayStop.ok) { "owners" } else if (shutdownPending > 0) { "state" } else { "complete" }
+            else if (!gatewayStop.ok) { "owners" } else if (!ownedProcessStop.ok || (phasesStopped && !scopeRestored)) { "owned_processes" }
+            else if (shutdownPending > 0) { "state" } else { "complete" }
         match (serveIdentity) {
             case Some(identity) =>
                 let completionWritten = gatewayWriteServeCompletionMarker(
@@ -514,7 +688,7 @@ public func runGatewayService(verbose!: Bool = false): Int64 {
                 let _ = gatewayReleaseServeLockForIdentity(identity)
             case None => gatewayReleaseServeLockQuiet()
         }
-        if (gatewayStop.ok && cronStop.ok && memoryStop.ok && canvasStop.ok && httpStop.ok && gatewayServerStop.ok && shutdownPending == 0) {
+        if (phasesStopped && scopeRestored && shutdownPending == 0) {
             gatewayServeLogger.info(MetisLogEvent.gatewayShutdown, "Gateway serve stopped")
         } else {
             gatewayServeLogger.error(MetisLogEvent.gatewayShutdown, "Gateway serve stopped with cleanup pending")

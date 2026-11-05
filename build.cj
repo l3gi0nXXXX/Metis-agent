@@ -122,6 +122,40 @@ func buildFFI(staticLib: Bool): Int64 {
     return 0
 }
 
+func buildManagedExecGate(): Int64 {
+    if (OS != "mac") { return 0 }
+    let directory = Path("./target/native")
+    let target = directory.join("metis-exec-gate-v1")
+    let temporary = directory.join("metis-exec-gate-v1.building")
+    try {
+        if (!exists(directory)) { Directory.create(directory, recursive: true) }
+        let info = FileInfo(directory)
+        if (!info.isDirectory() || info.isSymbolicLink()) {
+            eprintln("Private exec gate directory is invalid")
+            return 1
+        }
+        if (exists(temporary)) { remove(temporary) }
+        let status = launch("gcc", ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
+            "./src/process/managed_exec_gate.c", "-o", temporary.toString()]).wait()
+        if (status != 0) {
+            if (exists(temporary)) { remove(temporary) }
+            eprintln("Building private exec gate failed")
+            return 1
+        }
+        if (launch("chmod", ["755", temporary.toString()]).wait() != 0) {
+            remove(temporary)
+            eprintln("Setting private exec gate mode failed")
+            return 1
+        }
+        rename(temporary, to: target, overwrite: true)
+        return 0
+    } catch (_: Exception) {
+        try { if (exists(temporary)) { remove(temporary) } } catch (_: Exception) { () }
+        eprintln("Building private exec gate failed")
+        return 1
+    }
+}
+
 func downloadTreeSitter(): Int64 {
     let targetDir = "./ffi/tree-sitter-signature-extraction"
 
@@ -257,7 +291,7 @@ func stagePreBuild(): Int64 {
     } else {
         0
     }
-    return buildFFI(staticLib) | signatureStatus
+    return buildFFI(staticLib) | signatureStatus | buildManagedExecGate()
 }
 
 func stagePostBuild(): Int64 {

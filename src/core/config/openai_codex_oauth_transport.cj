@@ -1,10 +1,11 @@
 package metis.core.config
 
+import metis.process.managedRecoveryExecuteWithOutput
+
 import std.collection.ArrayList
 import std.convert.*
 import std.env.getVariable
 import std.net.{SocketAddress, TcpSocket}
-import std.process.executeWithOutput
 import std.time.*
 import stdx.encoding.base64.toBase64String
 import stdx.encoding.json.JsonObject
@@ -84,7 +85,7 @@ public class OpenAICodexOAuthScutilSystemProxyReader <: OpenAICodexOAuthSystemPr
 
     public func readSystemProxy(): String {
         try {
-            let (exitCode, stdoutBytes, _) = executeWithOutput("scutil", ["--proxy"])
+            let (exitCode, stdoutBytes, _) = managedRecoveryExecuteWithOutput("scutil", ["--proxy"])
             if (exitCode != 0) {
                 return ""
             }

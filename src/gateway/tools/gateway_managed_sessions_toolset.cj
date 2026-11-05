@@ -1,5 +1,7 @@
 package metis.gateway.tools
 
+import metis.process.managedRecoveryExecuteWithOutput
+
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
@@ -15,7 +17,6 @@ import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
 import std.core.Duration
 import std.fs.{Directory, File, OpenMode, Path, canonicalize, exists, remove, rename}
-import std.process.executeWithOutput
 import std.sync.{Condition, Mutex}
 import std.time.DateTime
 
@@ -521,7 +522,7 @@ public class GatewayManagedSessionsToolset {
             case None => ()
         }
         let args = ["gateway", "call", method, params.toJsonString()]
-        let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput("metis", args)
+        let (exitCode, stdoutBytes, stderrBytes) = managedRecoveryExecuteWithOutput("metis", args)
         let stdout = try { String.fromUtf8(stdoutBytes).trimAscii() } catch (_: Exception) { "" }
         let stderr = try { String.fromUtf8(stderrBytes).trimAscii() } catch (_: Exception) { "" }
         if (!stdout.isEmpty()) {

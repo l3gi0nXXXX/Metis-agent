@@ -491,9 +491,6 @@ public class LSPClient {
      * Close the LSP connection
      */
     public func close(): Unit {
-        if (!this.initialized) {
-            return
-        }
         this.fileCache.clearAll()
         this.jsonRpcClient.close()
         this.initialized = false

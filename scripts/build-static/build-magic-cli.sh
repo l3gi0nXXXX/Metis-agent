@@ -156,11 +156,17 @@ fi
 echo ""
 
 step "Step 3.2: Cleaning up existing project..."
-with_metis_cjpm_build_lock bash -lc 'cjpm clean >/dev/null 2>&1'
+if ! with_metis_cjpm_build_lock bash -lc 'cjpm clean >/dev/null 2>&1'; then
+    restore_files
+    exit 1
+fi
 echo ""
 
 step "Step 3.3: Building project with static configuration..."
-with_metis_cjpm_build_lock bash -lc 'cjpm build 2>/dev/null'
+if ! with_metis_cjpm_build_lock bash -lc 'cjpm build 2>/dev/null'; then
+    restore_files
+    exit 1
+fi
 echo ""
 
 # Step 4: Copy binary to target location
@@ -171,7 +177,10 @@ if [ ! -d "$BINARY_DIR" ]; then
 fi
 
 if [ -f "$TARGET_DIR/metis" ]; then
-    cp "$TARGET_DIR/metis" "$BINARY_DIR/magic-cli"
+    if ! cp "$TARGET_DIR/metis" "$BINARY_DIR/magic-cli"; then
+        restore_files
+        exit 1
+    fi
     success "Copied $TARGET_DIR/metis to $BINARY_DIR/magic-cli"
 else
     error "Binary not found at $TARGET_DIR/metis"
@@ -179,6 +188,19 @@ else
     exit 1
 fi
 echo ""
+
+# Darwin managed launches require the broker and its private native exec gate.
+if [ "$(uname -s)" = "Darwin" ]; then
+    case "$(uname -m)" in
+        arm64|aarch64) runtime_platform="macos-aarch64" ;;
+        x86_64) runtime_platform="macos-x86_64" ;;
+        *) error "Unsupported Darwin runtime architecture"; restore_files; exit 1 ;;
+    esac
+    if ! bash "$SCRIPT_DIR/stage-managed-runtime.sh" "$ROOT_DIR" "$BINARY_DIR" "$runtime_platform"; then
+        restore_files
+        exit 1
+    fi
+fi
 
 # Step 5: Restore original files
 step "Step 5: Cleaning up and restoring original files..."

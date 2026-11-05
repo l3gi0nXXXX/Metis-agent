@@ -1,9 +1,10 @@
 package metis.core.tools.fs_utils
 
+import metis.process.managedRecoveryExecuteWithOutput
+
 import std.fs.*
 import std.collection.*
 import std.collection.concurrent.ConcurrentHashMap
-import std.process.executeWithOutput
 import std.sync.Mutex
 import metis.core.config.CliConfig
 
@@ -89,7 +90,7 @@ public func ignored(path: Path): Bool {
                 }
             } else {
                 try {
-                    let (exitCode, _, _) = executeWithOutput("git", ["-C", repoRoot, "check-ignore", "--no-index", "-q", pathStr])
+                    let (exitCode, _, _) = managedRecoveryExecuteWithOutput("git", ["-C", repoRoot, "check-ignore", "--no-index", "-q", pathStr])
                     let isIgnored = exitCode == 0
                     gitCheckIgnoreCache[cacheKey] = isIgnored
                     if (isIgnored) {

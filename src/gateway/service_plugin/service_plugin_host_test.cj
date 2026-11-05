@@ -1,12 +1,42 @@
 package metis.gateway.service_plugin
 
+import std.runtime.{getThreadCount, getBlockingThreadCount}
+
+import metis.core.config.cliModelProviderCatalogDescriptors
+
+import std.core.Duration
+import std.env.getVariables
+import std.env.getCommand
+import std.env.removeVariable
+import std.fs.OpenMode
+import std.fs.copy
+import std.io.InputStream
+import std.posix.chmod
+import stdx.encoding.json.*
+import metis.core.config.MetisProcessEnvironmentLock
+import metis.process.ManagedOwnedChild
+import metis.process.managedStdioResolveNodeCommand
+import metis.process.parseProcessInstanceIdentity
+import metis.process.ProcessBirthIdentity
+import metis.core.config.CliConfig
+import metis.process.currentProcessInstanceIdentity
+import metis.process.launchManagedRawChild
+import metis.process.managedRecoveryInitialize
+import metis.process.managedRecoveryLaunchOwned
+import metis.process.managedRecoveryExecuteWithOutput
+import metis.process.managedRecoveryProbeRecords
+import metis.process.managedRecoveryStopOwnedChildren
+import metis.process.shutdownManagedStdioBroker
+import metis.process.observeProcessBirthIdentity
+import metis.process.probeProcessBirthIdentity
+
 import magic.config.Config
 import metis.gateway.logging.gatewayLoggingResetForTest
 import metis.process.{ManagedStdioOwnerSpec, managedStdioBroker, managedStdioResolveBrokerScriptPath, resetManagedStdioBrokerForTest}
 import std.collection.*
 import std.convert.Parsable
 import std.env.{getProcessId, getVariable, setVariable}
-import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists, remove}
+import std.fs.{Directory, File, FileInfo, Path, SymbolicLink, canonicalize, exists, remove}
 import std.net.{IPSocketAddress, TcpServerSocket}
 import std.process.*
 import std.sync.*
@@ -4901,6 +4931,7 @@ public class ServicePluginHostTest {
                     }))
                     @Expect(invokeRegisteredCapability(CapabilityInvokeRequest("gitcode.monitor.status", payload: "{}")).ok, true)
                     @Expect(dispatchGate.awaitEntered(2000), true)
+                    servicePluginInstallNativeBoundaryProbesForTest(home)
                     setServicePluginDispatchRemainingForTest(Some({ => remaining }))
                     if (remaining == 101) {
                         setServicePluginBeforeDispatchWaitForTest(Some({ waitMs: Int64 =>
@@ -4909,7 +4940,27 @@ public class ServicePluginHostTest {
                             @Expect(settledGate.awaitEntered(1000), true)
                         }))
                     }
+                    let stopStarted = MonoTime.now()
                     let stopped = stopServicePlugin("gitcode-monitor", reason: "边界中文🙂", timeoutMillis: 200)
+                    let stopElapsedMs = (MonoTime.now() - stopStarted).toMilliseconds()
+                    let fixedStage = { value: String =>
+                        if (["stopped", "cleanup_pending", "drained", "dispatch_pending", "cancelled", "sent",
+                            "write_failed", "deadline_exhausted", "not_started", "graceful_exited", "terminated",
+                            "force_terminated", "already_stopped", "still_alive", "not_applicable", "not_checked",
+                            "not_stopped", "invalid", "identity_mismatch", "released", "not_released",
+                            "probe_timeout", "port_probe_timeout", "pid_probe_timeout", "deadline_exceeded"].contains(value)) {
+                            value
+                        } else { "unknown" }
+                    }
+                    let diagnosticKind = if (stopped.diagnostic == "cleanup_identity_changed") { "cleanup_identity_changed" }
+                        else if (stopped.diagnostic.contains("lease_identity_mismatch_after_stop")) { "lease_identity_mismatch" }
+                        else if (stopped.diagnostic.contains("lease_invalid_after_stop")) { "lease_invalid" }
+                        else if (stopped.diagnostic.contains("lease_not_stopped_after_stop")) { "lease_not_stopped" }
+                        else if (stopped.diagnostic.contains("pid_alive_after_stop")) { "pid_alive" }
+                        else if (stopped.diagnostic.contains("pid_probe_timeout") || stopped.diagnostic.contains("terminal_probe_timeout")) { "probe_timeout" }
+                        else if (stopped.diagnostic.contains("lease_stopped")) { "lease_stopped" }
+                        else { "other_fixed_category" }
+                    println("S3-DEADLINE remaining=${remaining};stopElapsedMs=${stopElapsedMs};ok=${stopped.ok};status=${fixedStage(stopped.status)};ingress=${fixedStage(stopped.ingressStopStatus)};dispatch=${fixedStage(stopped.dispatchStatus)};owner=${fixedStage(stopped.ownerStopStatus)};lease=${fixedStage(stopped.leaseStatus)};port=${fixedStage(stopped.portStatus)};diagnosticKind=${diagnosticKind};stateFlushed=${stopped.stateFlushed};pending=${servicePluginCleanupPendingCountForTest()};brokerOwners=${managedStdioBroker().snapshot().ownerCount}")
                     @Expect(this.waitForFile(stopFrameMarker, timeoutMillis: 100), true)
                     @Expect(stopped.ingressStopStatus, "sent")
                     if (remaining <= 100) {
@@ -4949,6 +5000,8 @@ public class ServicePluginHostTest {
                     setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
                     setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
                     setServicePluginEventDeliveryForTest(None)
+                    setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+                    setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
                     resetServicePluginHostForTest()
                 }
             } finally {
@@ -4964,6 +5017,8 @@ public class ServicePluginHostTest {
                     case Some(value) => setVariable("METIS_STDIO_FIXTURE_STOP_FRAME_MARKER_PATH", value)
                     case None => setVariable("METIS_STDIO_FIXTURE_STOP_FRAME_MARKER_PATH", "")
                 }
+                setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+                setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
                 resetServicePluginHostForTest()
             }
         })
@@ -6513,5 +6568,1144 @@ public class ServicePluginHostTest {
         } finally {
             resetServicePluginHostForTest()
         }
+    }
+}
+
+
+// Isolate the dispatch-reserve boundary from unrelated diagnostic CLI startup.
+// Both callbacks still require actual OS proof before reporting terminal state.
+@When[os == "macOS"]
+private func servicePluginInstallNativeBoundaryProbesForTest(home: Path): Unit {
+    let binding = try {
+        let snapshot = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+        let birth = observeProcessBirthIdentity(snapshot.pid).getOrThrow()
+        let path = home.join("service-plugin").join("runtime").join("gitcode-monitor").join(snapshot.instanceId + ".lease.json")
+        let lease = JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+        let port = lease.get("port").getOrThrow().asInt().getValue()
+        if (snapshot.pid <= 1 || port <= 0 || port > 65535 ||
+            lease.get("pid").getOrThrow().asInt().getValue() != snapshot.pid ||
+            lease.get("parentPid").getOrThrow().asInt().getValue() != Int64(getProcessId()) ||
+            lease.get("sessionId").getOrThrow().asString().getValue() != snapshot.instanceId ||
+            lease.get("bindHost").getOrThrow().asString().getValue() != "127.0.0.1") {
+            throw Exception("s3_boundary_fixture_binding_invalid")
+        }
+        (snapshot.pid, birth, port)
+    } catch (_: Exception) { throw Exception("s3_boundary_fixture_binding_invalid") }
+    setServicePluginPidProbeCommandForTest(Some({ pid: Int64, timeoutMs: Int64 =>
+        if (pid != binding[0] || timeoutMs <= 0) { return (Int64(124), "", "") }
+        let deadline = MonoTime.now() + Duration.millisecond * timeoutMs
+        let probe = probeProcessBirthIdentity(binding[1], deadline)
+        if (MonoTime.now() > deadline || !probe.conclusive) { return (Int64(124), "", "") }
+        if (probe.alive && probe.status == "alive") { return (Int64(0), "", "") }
+        if (!probe.alive && probe.status == "gone") { return (Int64(1), "", "ESRCH") }
+        (Int64(124), "", "")
+    }))
+    setServicePluginPortReleaseCommandForTest(Some({ port: Int64, pid: Int64, timeoutMs: Int64 =>
+        if (pid != binding[0] || port != binding[2] || timeoutMs <= 0) { return (Int64(124), "", "") }
+        let deadline = MonoTime.now() + Duration.millisecond * timeoutMs
+        try {
+            try (socket = TcpServerSocket(bindAt: IPSocketAddress("127.0.0.1", UInt16(port)))) {
+                socket.reuseAddress = false
+                socket.reusePort = false
+                socket.bind()
+            }
+            if (MonoTime.now() > deadline) { (Int64(124), "", "") }
+            else { (Int64(1), "", "") }
+        } catch (_: Exception) { (Int64(124), "", "") }
+    }))
+}
+
+@When[os != "macOS"]
+private func servicePluginInstallNativeBoundaryProbesForTest(_home: Path): Unit { () }
+
+@When[os == "macOS"]
+private enum MtimeThinCaseSelection { Input0 | Input1 | Input2 | Input3 }
+
+@When[os == "macOS"]
+private func mtimeThinSelections(): Array<MtimeThinCaseSelection> { [MtimeThinCaseSelection.Input0, MtimeThinCaseSelection.Input1, MtimeThinCaseSelection.Input2, MtimeThinCaseSelection.Input3] }
+
+@When[os == "macOS"]
+private func mtimeThinKey(selected: MtimeThinCaseSelection): String {
+    match (selected) {
+        case MtimeThinCaseSelection.Input0 => "darwin"
+        case MtimeThinCaseSelection.Input1 => "fallback"
+        case MtimeThinCaseSelection.Input2 => "failure"
+        case MtimeThinCaseSelection.Input3 => "invalid"
+    }
+}
+
+@When[os == "macOS"]
+private func mtimeThinSelect(raw: Option<String>): MtimeThinCaseSelection {
+    match (raw) {
+        case Some(value) => match (value) {
+            case "darwin" => MtimeThinCaseSelection.Input0
+            case "fallback" => MtimeThinCaseSelection.Input1
+            case "failure" => MtimeThinCaseSelection.Input2
+            case "invalid" => MtimeThinCaseSelection.Input3
+            case _ => throw Exception("thin_input_selector_invalid")
+        }
+        case None => throw Exception("thin_input_selector_invalid")
+    }
+}
+
+// Scratch private-helper template. Instantiate once per package, not per test.
+// Required imports are listed in manifest; no production/public test framework.
+@When[os == "macOS"]
+foreign {
+    func proc_pidinfo(pid: Int32, flavor: Int32, arg: UInt64, buffer: CPointer<UInt64>, size: Int32): Int32
+}
+
+
+@When[os == "macOS"]
+private func mtimeThinText(path: Path): String {
+    try { String.fromUtf8(File.readFrom(path)) }
+    catch (_: Exception) { throw Exception("thin_fixture_invalid_encoding") }
+}
+
+@When[os == "macOS"]
+private func mtimeThinThreadSnapshot(): (Int64, Int64, Int64) {
+    (getThreadCount(), getBlockingThreadCount(), mtimeThinCount(6))
+}
+
+@When[os == "macOS"]
+private func mtimeThinThreadsWithin(baseline: (Int64, Int64, Int64)): Bool {
+    getThreadCount() <= baseline[0] && getBlockingThreadCount() <= baseline[1]
+}
+
+@When[os == "macOS"]
+private func mtimeThinCount(flavor: Int32): Int64 {
+    var slots = VArray<UInt64, $4096>(repeat: 0)
+    let count = unsafe { proc_pidinfo(Int32(getProcessId()), flavor, 0, inout slots, 32768) }
+    if (count <= 0 || count >= 32768 || count % 8 != 0) { throw Exception("thin_observation_failed") }
+    Int64(count) / 8
+}
+
+@When[os == "macOS"]
+private func mtimeThinRead(stream: InputStream): Array<Byte> {
+    let bytes = ArrayList<Byte>(); let buffer = Array<Byte>(4096, repeat: 0)
+    while (true) {
+        let count = stream.read(buffer)
+        if (count == 0) { return bytes.toArray() }
+        for (index in 0..count) { bytes.add(buffer[index]) }
+        if (bytes.size > 65536) { throw Exception("thin_diagnostic_oversize") }
+    }
+    bytes.toArray()
+}
+
+@When[os == "macOS"]
+private func mtimeThinJoin(worker: Future<Array<Byte>>, deadline: MonoTime): Bool {
+    let remaining = deadline - MonoTime.now()
+    if (remaining <= Duration.Zero) { return false }
+    try { let _ = worker.get(remaining); true }
+    catch (_: TimeoutException) { false }
+    catch (_: Exception) { true }
+}
+
+@When[os == "macOS"]
+private class MtimeThinCase {
+    let home: Path
+    let actor: Path
+    let journal: Path
+    let parent: String
+    let nonce: String
+    let bound: Bool
+    var failed = false
+    var completed = false
+    var auxiliaryJoined = true
+    var selectedCase = ""
+    var warmRounds: Int64 = 0
+    var formalRounds: Int64 = 0
+    var negativeRounds: Int64 = 0
+    var roundDirectory = None<Path>
+    let priorEnvironment = ArrayList<(String, Option<String>)>()
+    init(home: Path, actor: Path, nonce: String, bound: Bool) {
+        this.home = home; this.actor = actor; this.nonce = nonce; this.bound = bound
+        this.journal = home.join("inventory")
+        this.parent = currentProcessInstanceIdentity().getOrThrow().serialize()
+        for (key in ["METIS_PROCESS_RECOVERY_DIRECTORY", "METIS_PROCESS_RECOVERY_PARENT",
+            "METIS_PROCESS_RECOVERY_BROKER_KEY", "METIS_PROCESS_RECOVERY_OWNER_PID", "METIS_PROCESS_RECOVERY_OWNER_BIRTH",
+            "METIS_THIN_ACTOR_DIRECTORY", "METIS_THIN_ACTOR_NONCE", "METIS_THIN_ACTOR_CASE", "METIS_CJPM_ROOT", "PATH"]) {
+            priorEnvironment.add((key, getVariable(key)))
+        }
+        if (bound) { check(managedRecoveryInitialize(journal, parent, nonce)) }
+        else {
+            for (key in ["METIS_PROCESS_RECOVERY_DIRECTORY", "METIS_PROCESS_RECOVERY_PARENT",
+                "METIS_PROCESS_RECOVERY_BROKER_KEY", "METIS_PROCESS_RECOVERY_OWNER_PID", "METIS_PROCESS_RECOVERY_OWNER_BIRTH"]) {
+                removeVariable(key)
+            }
+        }
+    }
+    func check(value: Bool): Unit { failed = failed || !value; @Expect(value, true) }
+    func begin(name: String, commands: Array<String>): Unit {
+        let path = home.join(name); Directory.create(path); Directory.create(path.join("bin")); Directory.create(path.join("responses"))
+        File.writeTo(path.join("binding"), nonce.toArray())
+        for (command in commands) {
+            copy(actor, to: path.join("bin").join(command))
+            check(chmod(path.join("bin").join(command).toString(), 0o700u32) == 0)
+        }
+        roundDirectory = Some(path)
+        setVariable("METIS_THIN_ACTOR_DIRECTORY", path.toString())
+        setVariable("METIS_THIN_ACTOR_NONCE", nonce)
+        setVariable("METIS_THIN_ACTOR_CASE", "raw_routes")
+        // Only this controlled selfchild changes PATH; parent env is unchanged.
+        setVariable("PATH", path.join("bin").toString())
+    }
+    func route(command: String, phase: String, stdout: Array<Byte>, stderr: Array<Byte>, code: Int64): Unit {
+        let directory = roundDirectory.getOrThrow().join("responses")
+        let prefix = command + "." + phase
+        File.writeTo(directory.join(prefix + ".stdout.bin"), stdout)
+        File.writeTo(directory.join(prefix + ".stderr.bin"), stderr)
+        File.writeTo(directory.join(prefix + ".exit.txt"), code.toString().toArray())
+    }
+    func receipts(): Array<JsonObject> {
+        let results = ArrayList<JsonObject>()
+        for (entry in Directory.readFrom(roundDirectory.getOrThrow())) {
+            if (entry.name.startsWith("receipt-") && entry.name.endsWith(".json")) {
+                check(entry.isRegular() && !entry.isSymbolicLink())
+                let receipt = JsonValue.fromStr(mtimeThinText(entry.path)).asObject()
+                check(receipt.get("nonce").getOrThrow().asString().getValue() == nonce)
+                check(receipt.get("pid").getOrThrow().asInt().getValue() > 1)
+                results.add(receipt)
+            }
+        }
+        results.toArray()
+    }
+    func sourceTerminal(): Bool {
+        if (!bound) { return true }
+        let source = managedRecoveryProbeRecords(journal, parent, nonce, MonoTime.now() + Duration.second * 2)
+        source.ok && source.terminal
+    }
+    func terminal(): Bool { auxiliaryJoined && sourceTerminal() }
+    func stable(fd: Int64, threadBaseline: (Int64, Int64, Int64)): Unit {
+        let deadline = MonoTime.now() + Duration.second * 2
+        while (MonoTime.now() < deadline && (!sourceTerminal() || mtimeThinCount(1) > fd || !mtimeThinThreadsWithin(threadBaseline))) {
+            sleep(Duration.millisecond * 10)
+        }
+        check(sourceTerminal()); check(mtimeThinCount(1) == fd); check(mtimeThinThreadsWithin(threadBaseline))
+        let currentThreads = mtimeThinThreadSnapshot()
+        println("R-THREADS warmCjTasks=${threadBaseline[0]};finalCjTasks=${currentThreads[0]};warmCjBlocking=${threadBaseline[1]};finalCjBlocking=${currentThreads[1]};warmOsThreads=${threadBaseline[2]};finalOsThreads=${currentThreads[2]}")
+    }
+    func finish(): Unit { completed = !failed }
+    func restore(): Unit {
+        for ((key, prior) in priorEnvironment) {
+            match (prior) { case Some(text) => setVariable(key, text) case None => removeVariable(key) }
+        }
+    }
+}
+
+@When[os == "macOS"]
+private func mtimeThinCompileActor(home: Path,
+    sourceFile!: String = "thin_process_output_fixture.cj", outputName!: String = "owned-thin-actor"): (Path, Bool) {
+    if (!["thin_process_output_fixture.cj", "mcp_lifecycle_fixture.cj"].contains(sourceFile) ||
+        !["owned-thin-actor", "owned-mcp-actor"].contains(outputName)) { throw Exception("thin_actor_source_invalid") }
+    let source = canonicalize(Path("test/fixtures/service_plugin/stdio_protocol").join(sourceFile))
+    let sdk = canonicalize(Path(getVariable("CANGJIE_HOME").getOrThrow()))
+    let compilerPath = sdk.join("bin/cjc")
+    let magic = canonicalize(Path(getVariable("MAGIC_PATH").getOrThrow()))
+    let stdx = magic.join("libs/cangjie-stdx-mac-aarch64-1.0.0.1/darwin_aarch64_llvm/dynamic/stdx")
+    let binary = home.join(outputName)
+    let compiler = launchManagedRawChild(compilerPath.toString(), [source.toString(), "--import-path", stdx.toString(),
+        "-L", stdx.toString(), "-lstdx.encoding.json", "--link-options", "-rpath ${stdx.toString()}", "-o", binary.toString()],
+        newGeneration: true, stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.Pipe, stdErr: ProcessRedirect.Pipe)
+    var output = None<Future<Array<Byte>>>; var error = None<Future<Array<Byte>>>
+    var original = None<Exception>; var joined = false; var reaped = false
+    let operationDeadline = MonoTime.now() + Duration.second * 60
+    try {
+        output = Some(spawn { mtimeThinRead(compiler.stdOutPipe) }); error = Some(spawn { mtimeThinRead(compiler.stdErrPipe) })
+        let code = compiler.wait(timeout: Some(max(Duration.Zero, operationDeadline - MonoTime.now()))); reaped = true
+        let outputRemaining = operationDeadline - MonoTime.now()
+        if (outputRemaining <= Duration.Zero) { throw Exception("thin_actor_compile_timeout") }
+        let _ = output.getOrThrow().get(outputRemaining)
+        let errorRemaining = operationDeadline - MonoTime.now()
+        if (errorRemaining <= Duration.Zero) { throw Exception("thin_actor_compile_timeout") }
+        let _ = error.getOrThrow().get(errorRemaining)
+        if (code != 0 || !exists(binary) || !FileInfo(binary).isRegular()) { throw Exception("thin_actor_compile_failed") }
+    } catch (failure: Exception) { original = Some(failure) }
+    finally {
+        let cleanupDeadline = MonoTime.now() + Duration.second * 3
+        try {
+            if (compiler.isAlive()) { compiler.terminate(force: true) }
+            let _ = compiler.wait(timeout: Some(max(Duration.Zero, cleanupDeadline - MonoTime.now()))); reaped = true
+        } catch (failure: Exception) { if (original.isNone()) { original = Some(failure) } }
+        finally {
+            try { compiler.closeStreams() }
+            catch (failure: Exception) { if (original.isNone()) { original = Some(failure) } }
+            finally {
+                let outputJoined = output.map({ worker => mtimeThinJoin(worker, cleanupDeadline) }) ?? true
+                let errorJoined = error.map({ worker => mtimeThinJoin(worker, cleanupDeadline) }) ?? true
+                joined = outputJoined && errorJoined && MonoTime.now() <= cleanupDeadline
+                try { File.writeTo(home.join("compiler-proof"), "joined:${joined}\nreaped:${reaped}\n".toArray()) }
+                catch (failure: Exception) { if (original.isNone()) { original = Some(failure) } }
+            }
+        }
+    }
+    if (let Some(failure) <- original) { throw failure }
+    if (!joined || !reaped || !compiler.streamsAreClosed()) { throw Exception("thin_actor_compile_pending") }
+    (binary, true)
+}
+
+@When[os == "macOS"]
+private func mtimeThinRun(filter: String, action: (MtimeThinCase) -> Unit, stdin!: Array<Byte> = []): Unit {
+    if (let Some(outerText) <- getVariable("METIS_THIN_OUTER")) {
+        let outer = canonicalize(Path(outerText))
+        let nonce = getVariable("METIS_THIN_OUTER_NONCE").getOrThrow()
+        if (!outer.toString().startsWith("/private/tmp/") || mtimeThinText(outer.join("owned.marker")) != nonce) {
+            throw Exception("thin_outer_binding_invalid")
+        }
+        let home = canonicalize(Path(getVariable("METIS_HOME").getOrThrow()))
+        let actor = canonicalize(Path(getVariable("METIS_THIN_ACTOR_BINARY").getOrThrow()))
+        if (!home.toString().startsWith(outer.toString() + "/") || actor != outer.join("owned-thin-actor")) {
+            throw Exception("thin_actor_binding_invalid")
+        }
+        let selected = mtimeThinSelect(getVariable("METIS_THIN_INPUT_CASE"))
+        let fixture = MtimeThinCase(home, actor, nonce, getVariable("METIS_THIN_BOUND") == Some("true"))
+        fixture.selectedCase = mtimeThinKey(selected)
+        var original = None<Exception>
+        try { action(fixture) }
+        catch (failure: Exception) { original = Some(failure) }
+        finally {
+            try {
+                let terminal = fixture.terminal()
+                let childFormal = fixture.completed && !fixture.failed && original.isNone() && terminal
+                File.writeTo(home.join("formal-before-fallback.json"),
+                    ("{\"formal\":${childFormal},\"terminal\":${terminal},\"recorded\":true," +
+                        "\"case\":\"${fixture.selectedCase}\",\"nonce\":\"${nonce}\",\"bound\":${fixture.bound}," +
+                        "\"warmRounds\":${fixture.warmRounds},\"formalRounds\":${fixture.formalRounds},\"negativeRounds\":${fixture.negativeRounds}}").toArray())
+                if (!childFormal && original.isNone()) { original = Some(Exception("thin_input_child_formal_failed")) }
+            } catch (failure: Exception) { if (original.isNone()) { original = Some(failure) } }
+            finally {
+                let cleanupDeadline = MonoTime.now() + Duration.second * 3
+                try {
+                    var terminal = fixture.auxiliaryJoined
+                    if (fixture.bound) {
+                        let stopped = managedRecoveryStopOwnedChildren((fixture.journal.toString(), fixture.parent), cleanupDeadline)
+                        let source = managedRecoveryProbeRecords(fixture.journal, fixture.parent, fixture.nonce, cleanupDeadline)
+                        terminal = terminal && stopped && source.ok && source.terminal
+                    }
+                    terminal = terminal && MonoTime.now() <= cleanupDeadline
+                    if (terminal) { fixture.restore() }
+                    else if (original.isNone()) { original = Some(Exception("thin_child_cleanup_pending_evidence_retained")) }
+                } catch (failure: Exception) { if (original.isNone()) { original = Some(failure) } }
+            }
+        }
+        if (let Some(failure) <- original) { throw failure }
+        return
+    }
+    synchronized(MetisProcessEnvironmentLock) {
+        let outer = Directory.createTemp("/private/tmp")
+        let nonce = DateTime.now().toUnixTimeStamp().toNanoseconds().toString()
+        File.writeTo(outer.join("owned.marker"), nonce.toArray())
+        println("R-WRAP fixture=${outer.fileName};nonce=${nonce};kind=${filter}")
+        var formal = false
+        var compilerReady = false
+        let aggregateDeadline = MonoTime.now() + Duration.second * 583
+        var aggregateFormal: Int64 = 0
+        var aggregateWarm: Int64 = 0
+        var aggregateNegative: Int64 = 0
+        let completedCases = HashMap<String, Int64>()
+        try {
+            let artifact = mtimeThinCompileActor(outer); compilerReady = artifact[1]
+            let (_, nodeBytes, _) = managedRecoveryExecuteWithOutput("which", ["node"])
+            let node = try { String.fromUtf8(nodeBytes).trimAscii() }
+                catch (_: Exception) { throw Exception("thin_node_resolution_failed") }
+            if (node.isEmpty() || !Path(node).isAbsolute() || !FileInfo(node).isRegular()) {
+                throw Exception("thin_node_resolution_failed")
+            }
+            var allCases = true
+            var selectorRejections: Int64 = 0
+            let invalidSelections: Array<Option<String>> = [None, Some("unknown")]
+            for (raw in invalidSelections) {
+                try { let _ = mtimeThinSelect(raw) }
+                catch (failure: Exception) { if (failure.message == "thin_input_selector_invalid") { selectorRejections += 1 } }
+            }
+            if (selectorRejections != 2) { throw Exception("thin_input_selector_validation_failed") }
+            let selections = mtimeThinSelections()
+            if (selections.size != 4) { throw Exception("thin_input_matrix_incomplete") }
+            for (mode in ["absent", "bound"]) {
+                for (selected in selections) {
+                    let caseName = mtimeThinKey(selected)
+                    let scheduleKey = mode + "-" + caseName
+                    if (completedCases.contains(scheduleKey) || MonoTime.now() >= aggregateDeadline) { throw Exception("thin_input_schedule_invalid") }
+                    let home = outer.join(scheduleKey); Directory.create(home)
+                    File.writeTo(home.join("metis.json"), "{}".toArray())
+                    File.writeTo(home.join("stdin"), stdin)
+                    let environment = HashMap(getVariables())
+                    let providerAliases = ArrayList<String>()
+                    for (descriptor in cliModelProviderCatalogDescriptors()) {
+                        for (alias in descriptor.apiKeyEnvAliases) { providerAliases.add(alias.toAsciiUpper()) }
+                    }
+                    for (name in environment.keys().toArray()) {
+                        let upper = name.toAsciiUpper()
+                        if (upper.contains("PROXY") || upper.endsWith("_TOKEN") || upper.endsWith("_API_KEY") ||
+                            upper.contains("SECRET") || upper.contains("PASSWORD") || upper.contains("CREDENTIAL") ||
+                            upper.endsWith("_ACCESS_KEY_ID") || providerAliases.contains(upper)) { environment.remove(name) }
+                    }
+                    environment["METIS_HOME"] = home.toString()
+                    environment["CURL_HOME"] = home.toString(); environment["XDG_CONFIG_HOME"] = home.toString()
+                    environment["METIS_LOG_FILE"] = home.join("child.log").toString()
+                    environment["METIS_THIN_OUTER"] = outer.toString(); environment["METIS_THIN_OUTER_NONCE"] = nonce
+                    environment["METIS_THIN_ACTOR_BINARY"] = artifact[0].toString()
+                    environment["METIS_THIN_TEST_HOME"] = home.toString()
+                    environment["METIS_THIN_BOUND"] = (mode == "bound").toString()
+                    environment["METIS_THIN_INPUT_CASE"] = caseName
+                    environment["METIS_PROCESS_RECOVERY_DIRECTORY"] = ""; environment["METIS_PROCESS_RECOVERY_PARENT"] = ""
+                    environment["METIS_STDIO_BROKER_NODE_COMMAND"] = node
+                    environment["METIS_STDIO_BROKER_SCRIPT"] = canonicalize(Path("scripts/metis-stdio-broker.mjs")).toString()
+                    let driver = outer.join(scheduleKey + "-driver-inventory")
+                    let parent = currentProcessInstanceIdentity().getOrThrow().serialize()
+                    let binding = "thin-driver-" + scheduleKey + nonce
+                    let prior = ArrayList<(String, Option<String>)>()
+                    for (key in ["METIS_PROCESS_RECOVERY_DIRECTORY", "METIS_PROCESS_RECOVERY_PARENT", "METIS_STDIO_BROKER_SCRIPT",
+                        "METIS_STDIO_BROKER_NODE_COMMAND"]) { prior.add((key, getVariable(key))) }
+                    var child = None<ManagedOwnedChild>; var reaped = false; var terminal = false; var childFormal = false
+                    var launchPending = false
+                    var bodyFailure = None<Exception>
+                    try {
+                        setVariable("METIS_STDIO_BROKER_SCRIPT", environment["METIS_STDIO_BROKER_SCRIPT"])
+                        setVariable("METIS_STDIO_BROKER_NODE_COMMAND", node)
+                        if (!managedRecoveryInitialize(driver, parent, binding)) { throw Exception("thin_driver_inventory_failed") }
+                        try (input = File(home.join("stdin"), OpenMode.Read), output = File(home.join("stdout"), OpenMode.Write), error = File(home.join("stderr"), OpenMode.Write)) {
+                            launchPending = true
+                            child = Some(managedRecoveryLaunchOwned(getCommand(), ["--filter=" + filter, "--parallel=1",
+                                "--no-progress", "--no-color", "--no-capture-output"], environment: Some<Map<String, String>>(environment),
+                                stdIn: ProcessRedirect.FromFile(input), stdOut: ProcessRedirect.FromFile(output), stdErr: ProcessRedirect.FromFile(error)))
+                            launchPending = false
+                        }
+                        let remaining = aggregateDeadline - MonoTime.now()
+                        if (remaining <= Duration.Zero) { throw Exception("thin_input_aggregate_deadline") }
+                        let code = child.getOrThrow().wait(timeout: Some(min(Duration.second * 60, remaining))); reaped = true
+                        child.getOrThrow().closeStreams()
+                        let proof = JsonValue.fromStr(mtimeThinText(home.join("formal-before-fallback.json"))).asObject()
+                        let source = managedRecoveryProbeRecords(driver, parent, binding, MonoTime.now() + Duration.second * 3)
+                        terminal = source.ok && source.terminal
+                        childFormal = code == 0 && terminal && proof.get("formal").getOrThrow().asBool().getValue() &&
+                            proof.get("terminal").getOrThrow().asBool().getValue() && proof.get("recorded").getOrThrow().asBool().getValue() &&
+                            proof.get("case").getOrThrow().asString().getValue() == caseName &&
+                            proof.get("nonce").getOrThrow().asString().getValue() == nonce &&
+                            proof.get("bound").getOrThrow().asBool().getValue() == (mode == "bound") &&
+                            proof.get("warmRounds").getOrThrow().asInt().getValue() == 2 &&
+                            proof.get("formalRounds").getOrThrow().asInt().getValue() == 32 &&
+                            proof.get("negativeRounds").getOrThrow().asInt().getValue() == (if (caseName == "darwin") { 0 } else { 0 })
+                        if (childFormal) {
+                            completedCases[scheduleKey] = proof.get("formalRounds").getOrThrow().asInt().getValue()
+                            aggregateFormal += proof.get("formalRounds").getOrThrow().asInt().getValue()
+                            aggregateWarm += proof.get("warmRounds").getOrThrow().asInt().getValue()
+                            aggregateNegative += proof.get("negativeRounds").getOrThrow().asInt().getValue()
+                        }
+                        allCases = allCases && childFormal
+                        @Expect(childFormal, true)
+                        if (!childFormal) { throw Exception("thin_input_child_formal_failed") }
+                    } catch (failure: Exception) { bodyFailure = Some(failure) }
+                    finally {
+                        try {
+                            File.writeTo(home.join("parent-formal-before-fallback"),
+                                "formal:${childFormal}\nreaped:${reaped}\nterminal:${terminal}\ncase:${caseName}\n".toArray())
+                        } catch (failure: Exception) { if (bodyFailure.isNone()) { bodyFailure = Some(failure) } }
+                        finally {
+                            let cleanupDeadline = MonoTime.now() + Duration.second * 3
+                            if (let Some(handle) <- child) {
+                                try {
+                                    if (handle.isAlive()) { handle.terminate(force: true) }
+                                    let left = max(Duration.Zero, cleanupDeadline - MonoTime.now())
+                                    let _ = handle.wait(timeout: Some(left)); reaped = true
+                                } catch (failure: Exception) { if (bodyFailure.isNone()) { bodyFailure = Some(failure) } }
+                                finally {
+                                    try { handle.closeStreams() }
+                                    catch (failure: Exception) { if (bodyFailure.isNone()) { bodyFailure = Some(failure) } }
+                                }
+                            }
+                            try {
+                                let stopped = managedRecoveryStopOwnedChildren((driver.toString(), parent), cleanupDeadline)
+                                let source = managedRecoveryProbeRecords(driver, parent, binding, cleanupDeadline)
+                                terminal = !launchPending && stopped && source.ok && source.terminal && reaped &&
+                                    child.isSome() && child.getOrThrow().streamsAreClosed() && MonoTime.now() <= cleanupDeadline
+                                if (terminal) {
+                                    for ((key, value) in prior) {
+                                        match (value) { case Some(text) => setVariable(key, text) case None => removeVariable(key) }
+                                    }
+                                } else {
+                                    allCases = false
+                                    if (bodyFailure.isNone()) { bodyFailure = Some(Exception("thin_driver_cleanup_pending")) }
+                                }
+                            } catch (failure: Exception) { allCases = false; if (bodyFailure.isNone()) { bodyFailure = Some(failure) } }
+                        }
+                    }
+                    if (let Some(failure) <- bodyFailure) { throw failure }
+                }
+            }
+            for (mode in ["absent", "bound"]) {
+                for (selected in selections) {
+                    if (completedCases.get(mode + "-" + mtimeThinKey(selected)) != Some<Int64>(32)) { throw Exception("thin_input_matrix_incomplete") }
+                }
+            }
+            if (completedCases.size != 8 || aggregateFormal != 256 || aggregateWarm != 16 || aggregateNegative != 0 ||
+                MonoTime.now() > aggregateDeadline) { throw Exception("thin_input_matrix_incomplete") }
+            File.writeTo(outer.join("aggregate-formal.json"),
+                ("{\"children\":${completedCases.size},\"formalRounds\":${aggregateFormal},\"warmRounds\":${aggregateWarm}," +
+                    "\"negativeRounds\":${aggregateNegative},\"selectorRejections\":${selectorRejections},\"parentScheduleSeconds\":583}").toArray())
+
+            formal = allCases
+        } finally {
+            if (formal && compilerReady) { remove(outer, recursive: true) }
+            else { eprintln("thin_interface_failure_evidence_retained") }
+        }
+    }
+}
+
+@When[os == "macOS"]
+private func mtimeThinMtimeManifest(script: String): ServicePluginManifest {
+    let caps = ArrayList<ServiceCapabilityRecord>()
+    caps.add(ServiceCapabilityRecord("gitcode.event.accepted", "event"))
+    caps.add(ServiceCapabilityRecord("gitcode.writeback.apply_result", "controlAction"))
+    ServicePluginManifest(schema: METIS_SERVICE_PLUGIN_SCHEMA, pluginId: "gitcode-monitor",
+        displayName: "Owned Mtime Fixture", kind: "service", protocolVersion: "1.0",
+        entryCommand: "/bin/sh", entryArgs: ["-c", script], hasConfigSchema: true, capabilityDeclarations: caps)
+}
+
+
+@When[os == "macOS"]
+private func mtimeThinExpectedMtime(path: String): String {
+    // Absolute test-only CLI is an independent oracle, never the PATH actor.
+    try {
+        let result = managedRecoveryExecuteWithOutput("/usr/bin/stat", ["-L", "-f", "%m", path])
+        if (result[0] != 0) { throw Exception("thin_mtime_oracle_failed") }
+        let seconds = Int64.parse(String.fromUtf8(result[1]).trimAscii())
+        if (seconds < 0) { throw Exception("thin_mtime_oracle_failed") }
+        seconds.toString()
+    } catch (_: Exception) {
+        throw Exception("thin_mtime_oracle_failed")
+    }
+}
+
+@When[os == "macOS"]
+@Test
+public class ThinServicePluginMtimeResourceTest {
+    @TestCase
+    public func rWrapServicePluginMtimeUsesNativeMetadata(): Unit {
+        mtimeThinRun("ThinServicePluginMtimeResourceTest.rWrapServicePluginMtimeUsesNativeMetadata", { fixture =>
+            let previous = ArrayList<(String, Option<String>)>()
+            for (key in ["METIS_LOG_LEVEL", "METIS_LOG_FILE", "METIS_CONSOLE_LEVEL"]) { previous.add((key, getVariable(key))) }
+            resetServicePluginHostForTest()
+            fixture.check(shutdownManagedStdioBroker().ok)
+            let expectedMtime = mtimeThinExpectedMtime("/bin/sh")
+            let coldFd = mtimeThinCount(1); let coldThreadBaseline = mtimeThinThreadSnapshot()
+            // These former stat branches are now poison inputs: none may execute.
+            let cases: Array<(String, Array<Byte>, Int64)> = [
+                ("darwin", "1234567890\n".toArray(), 0),
+                ("fallback", [], 0),
+                ("failure", [], 7),
+                ("invalid", [255u8, 254u8, 128u8, 0u8], 0)]
+            var completed: Int64 = 0
+            var warmFd: Int64 = 0; var warmThreadBaseline: (Int64, Int64, Int64) = (0, 0, 0)
+            try {
+                for (index in 0..cases.size + 1) {
+                    if (index > 0 && cases[index - 1][0] != fixture.selectedCase) { continue }
+                    let item = if (index == 0) { cases[0] } else { cases[index - 1] }
+                    let rounds = if (index == 0) { 2 } else { 32 }
+                    for (round in 0..rounds) {
+                        fixture.begin("mtime-${index}-${round}", ["stat"])
+                        fixture.route("stat", "main", item[1], [], item[2])
+                        if (item[0] == "fallback") { setVariable("METIS_THIN_ACTOR_CASE", "mtime_darwin_failure") }
+                        let log = fixture.roundDirectory.getOrThrow().join("service.log")
+                        setVariable("METIS_LOG_LEVEL", "debug"); setVariable("METIS_LOG_FILE", log.toString())
+                        setVariable("METIS_CONSOLE_LEVEL", "silent"); gatewayLoggingResetForTest()
+                        let initialize = "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"gitcode-monitor\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ready\"}}"
+                        let script = "printf '%s\\n' '${initialize}'; read ignored || true"
+                        fixture.check(registerServicePlugin(ServicePluginRegistration(mtimeThinMtimeManifest(script),
+                            configRef: ServicePluginConfigRef(secretRef: "fixture-only-secret", manifestPath: fixture.home.join("owned-plugin.json").toString()))).ok)
+                        fixture.check(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok)
+                        let identity = servicePluginActiveIdentityForTest("gitcode-monitor")
+                        fixture.check(identity.isSome())
+                        let text = mtimeThinText(log)
+                        fixture.check(!text.contains(fixture.home.toString()) && !text.contains("fixture-only-secret"))
+                        var pid: Int64 = 0; var records: Int64 = 0
+                        for (line in text.split("\n")) {
+                            if (line.trimAscii().isEmpty()) { continue }
+                            let row = JsonValue.fromStr(line).asObject()
+                            if (row.get("binaryMtime").isSome()) {
+                                fixture.check(row.get("binaryMtime").getOrThrow().asString().getValue() == expectedMtime)
+                                pid = Int64.parse(row.get("pid").getOrThrow().asString().getValue()); records += 1
+                            }
+                        }
+                        fixture.check(records == 1 && pid > 1)
+                        let birth = observeProcessBirthIdentity(pid); fixture.check(birth.isSome())
+                        let still = servicePluginActiveIdentityForTest("gitcode-monitor"); fixture.check(still.isSome())
+                        if (identity.isSome() && still.isSome()) {
+                            let first = identity.getOrThrow(); let second = still.getOrThrow()
+                            fixture.check(first[0] == second[0] && first[1] == second[1] && first[2] == second[2])
+                        }
+                        fixture.check(fixture.receipts().size == 0)
+                        resetServicePluginHostForTest()
+                        fixture.check(servicePluginActiveIdentityForTest("gitcode-monitor").isNone())
+                        fixture.check(servicePluginCleanupPendingCountForTest() == 0)
+                        fixture.check(managedStdioBroker().snapshot().ownerCount == 0)
+                        if (let Some(value) <- birth) {
+                            let gone = probeProcessBirthIdentity(value, MonoTime.now() + Duration.second * 2)
+                            fixture.check(gone.conclusive && !gone.alive)
+                        }
+                        if (index > 0) {
+                            let deadline = MonoTime.now() + Duration.second * 2
+                            while (MonoTime.now() < deadline && (mtimeThinCount(1) != warmFd || !mtimeThinThreadsWithin(warmThreadBaseline))) { sleep(Duration.millisecond * 10) }
+                            fixture.check(mtimeThinCount(1) == warmFd && mtimeThinThreadsWithin(warmThreadBaseline))
+                            let currentThreads = mtimeThinThreadSnapshot()
+                            println("R-MTIME-THREADS warmCjTasks=${warmThreadBaseline[0]};finalCjTasks=${currentThreads[0]};warmCjBlocking=${warmThreadBaseline[1]};finalCjBlocking=${currentThreads[1]};warmOsThreads=${warmThreadBaseline[2]};finalOsThreads=${currentThreads[2]}")
+                            completed += 1; fixture.formalRounds += 1
+                        } else { fixture.warmRounds += 1 }
+                    }
+                    if (index == 0) { warmFd = mtimeThinCount(1); warmThreadBaseline = mtimeThinThreadSnapshot() }
+                }
+                fixture.check(shutdownManagedStdioBroker().ok)
+                fixture.stable(coldFd, coldThreadBaseline)
+                fixture.check(completed == 32 && fixture.formalRounds == 32 && fixture.warmRounds == 2 &&
+                fixture.negativeRounds == (if (fixture.selectedCase == "darwin") { 0 } else { 0 }))
+                println("R-WRAP-MTIME case=${fixture.selectedCase};actualRounds=${completed};bound=${fixture.bound};sourceTerminal=${fixture.terminal()};formal=${!fixture.failed}")
+                fixture.finish()
+            } finally {
+                resetServicePluginHostForTest()
+                let closed = shutdownManagedStdioBroker().ok
+                if (closed && fixture.terminal()) {
+                    for ((key, value) in previous) {
+                        match (value) { case Some(text) => setVariable(key, text) case None => removeVariable(key) }
+                    }
+                    gatewayLoggingResetForTest()
+                } else { fixture.check(false) }
+            }
+        })
+    }
+
+    @TestCase
+    public func nativeBinaryMtimeGuardsMissingAndUnicodePaths(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = Directory.createTemp("/private/tmp")
+            try {
+                let target = home.join("中文😀-binary")
+                let link = home.join("链接😀")
+                let broken = home.join("失效链接😀")
+                File.writeTo(target, "owned fixture".toArray())
+                let touched = managedRecoveryExecuteWithOutput("/usr/bin/touch", ["-t", "200001010000.00", target.toString()])
+                @Expect(touched[0], 0)
+                SymbolicLink.create(link, to: target)
+                SymbolicLink.create(broken, to: home.join("missing"))
+                let expected = mtimeThinExpectedMtime(target.toString())
+                @Expect(Int64.parse(expected) < 1000000000, true)
+                @Expect(servicePluginBinaryMtimeDiagnostic(target.toString()), expected)
+                @Expect(servicePluginBinaryMtimeDiagnostic(link.toString()), expected)
+                @Expect(servicePluginBinaryMtimeDiagnostic("  " + target.toString() + "  "), expected)
+                for (path in ["", " \t\n", home.join("不存在😀").toString(), broken.toString(),
+                    home.join(String(Array<Rune>(16384, repeat: r'中'))).toString()]) {
+                    @Expect(servicePluginBinaryMtimeDiagnostic(path), "unavailable")
+                }
+            } finally {
+                remove(home, recursive: true)
+            }
+        }
+    }
+
+}
+
+
+// These tests execute the actual supervisor loop in isolated selfchildren.
+// Gates pause real publication/probes; no task, owner, wait or terminal is faked.
+@When[os == "macOS"]
+private class SupervisorOwnedFixture {
+    let home: Path
+    let nonce: String
+    let journal: Path
+    let parent: String
+    let gates = ArrayList<ServicePluginTestGate>()
+    let workers = ArrayList<Future<Unit>>()
+    var failed = false
+    let priorAttach: Option<(String) -> Unit>
+    let priorEnvironment = ArrayList<(String, Option<String>)>()
+    init(home: Path, nonce: String) {
+        this.home = home
+        this.nonce = nonce
+        this.journal = home.join("inventory")
+        this.parent = currentProcessInstanceIdentity().getOrThrow().serialize()
+        this.priorAttach = setServicePluginBeforeSupervisorAttachForTest(None)
+        for (key in ["METIS_PROCESS_RECOVERY_DIRECTORY", "METIS_PROCESS_RECOVERY_PARENT",
+            "METIS_PROCESS_RECOVERY_BROKER_KEY", "METIS_PROCESS_RECOVERY_OWNER_PID", "METIS_PROCESS_RECOVERY_OWNER_BIRTH"]) {
+            priorEnvironment.add((key, getVariable(key)))
+        }
+        check(managedRecoveryInitialize(journal, parent, nonce))
+        File.writeTo(home.join("child-identity.json"),
+            ("{\"nonce\":\"${nonce}\",\"parent\":\"${parent}\"}").toArray())
+        CliConfig.invalidatePathCache()
+        resetServicePluginHostForTest()
+    }
+    func check(value: Bool): Unit {
+        failed = failed || !value
+        @Expect(value, true)
+        if (!value) { throw Exception("supervisor_fixture_formal_failed") }
+    }
+    func gate(): ServicePluginTestGate {
+        let result = ServicePluginTestGate(); gates.add(result); result
+    }
+    func state(serviceId!: String = "gitcode-monitor"): ServicePluginSupervisorOwnershipForTest {
+        servicePluginSupervisorOwnershipForTest(serviceId)
+    }
+    func awaitState(predicate: (ServicePluginSupervisorOwnershipForTest) -> Bool): Unit {
+        let deadline = MonoTime.now() + Duration.second * 2
+        while (MonoTime.now() < deadline) {
+            if (predicate(state())) { return }
+            sleep(Duration.millisecond * 5)
+        }
+        check(predicate(state()))
+    }
+    func register(config: ServicePluginSupervisorConfig, serviceId!: String = "gitcode-monitor", reset!: Bool = true): Unit {
+        if (reset) { resetServicePluginHostForTest() }
+        var port: Int64 = 0
+        try (socket = TcpServerSocket(bindAt: 0u16)) {
+            socket.bind()
+            port = Int64((socket.localAddress as IPSocketAddress).getOrThrow().port)
+        }
+        let running = "printf '{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s,\"bindHost\":\"127.0.0.1\",\"port\":${port},\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\""
+        let stopped = running.replace("running", "stopped")
+        let initFrame = "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"gitcode-monitor\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ready\"}}"
+        // initialize must be consumed without terminating the fake service.
+        let script = "${running}; printf '%s\\n' '${initFrame}'; metis_stop() { ${stopped}; }; trap 'metis_stop; exit 0' TERM HUP INT; while IFS= read -r line; do case \"$line\" in *'\"method\":\"stop\"'*|*'\"method\": \"stop\"'*) metis_stop; exit 0;; esac; done"
+        let manifest = if (serviceId == "gitcode-monitor") { mtimeThinMtimeManifest(script) }
+        else {
+            let capabilities = ArrayList<ServiceCapabilityRecord>()
+            capabilities.add(ServiceCapabilityRecord(serviceId + ".monitor.status", "controlAction"))
+            ServicePluginManifest(schema: METIS_SERVICE_PLUGIN_SCHEMA, pluginId: serviceId,
+                displayName: "Owned Supervisor Fixture", kind: "service", protocolVersion: "1.0",
+                entryCommand: "/bin/sh", entryArgs: ["-c", script.replace("gitcode-monitor", serviceId)],
+                hasConfigSchema: true, capabilityDeclarations: capabilities)
+        }
+        check(registerServicePlugin(ServicePluginRegistration(manifest)).ok)
+        setServicePluginSupervisorConfigForTest(config)
+        setServicePluginHealthzProbeForTest(Some({ _url: String, _timeout: Int64 =>
+            ServicePluginHealthzProbeResult(true, statusCode: 200) }))
+        setServicePluginPortReleaseCommandForTest(Some({ _port: Int64, _pid: Int64, _timeout: Int64 => (Int64(1), "", "") }))
+    }
+    func start(): Unit {
+        check(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 2000).ok)
+        awaitState({ value => value.owned == 1 && value.awaitingAttach == 0 })
+    }
+    func stop(): Unit {
+        check(stopServicePlugin("gitcode-monitor", reason: "supervisor_owned_test", timeoutMillis: 2000).ok)
+        check(state().owned == 0 && state().currentToken == 0)
+    }
+    func proof(name: String): Unit {
+        let value = state()
+        File.writeTo(home.join(name + ".json"),
+            ("{\"nonce\":\"${nonce}\",\"owned\":${value.owned},\"token\":${value.currentToken}," +
+             "\"awaitingAttach\":${value.awaitingAttach},\"bodyFinished\":${value.bodyFinished},\"failed\":${failed}}").toArray())
+    }
+    func beforeGateRelease(name: String, serviceIds!: Array<String> = ["gitcode-monitor"]): Unit {
+        // Only this diagnostic work is caught. A body's original exception is
+        // never caught/replaced here, and failure still lets every gate release.
+        try {
+            let proof = JsonObject()
+            proof.put("nonce", JsonString(nonce))
+            proof.put("failed", JsonBool(failed))
+            let services = JsonObject()
+            for (serviceId in serviceIds) {
+                let observed = state(serviceId: serviceId)
+                let row = JsonObject()
+                row.put("token", JsonInt(observed.currentToken))
+                row.put("owned", JsonInt(observed.owned))
+                row.put("awaitingAttach", JsonInt(observed.awaitingAttach))
+                row.put("bodyFinished", JsonInt(observed.bodyFinished))
+                services.put(serviceId, row)
+            }
+            proof.put("services", services)
+            File.writeTo(home.join("before-release-" + name + ".json"), proof.toJsonString().toArray())
+        } catch (_: Exception) { failed = true }
+    }
+    func sourceTerminal(deadline: MonoTime): Bool {
+        let proof = managedRecoveryProbeRecords(journal, parent, nonce, deadline)
+        proof.ok && proof.terminal
+    }
+    func stable(fd: Int64, tasks: (Int64, Int64, Int64)): Unit {
+        let deadline = MonoTime.now() + Duration.second * 2
+        while (MonoTime.now() < deadline &&
+            (mtimeThinCount(1) != fd || !mtimeThinThreadsWithin(tasks) || state().owned != 0)) {
+            sleep(Duration.millisecond * 5)
+        }
+        check(mtimeThinCount(1) == fd)
+        check(mtimeThinThreadsWithin(tasks))
+        check(state().owned == 0)
+        let brokerRemaining = (deadline - MonoTime.now()).toMilliseconds()
+        check(brokerRemaining > 0)
+        check(shutdownManagedStdioBroker(timeoutMs: brokerRemaining).ok)
+        check(sourceTerminal(deadline))
+    }
+    func finish(): Bool {
+        // Called only after the formal proof. A failed proof must not skip gates,
+        // worker joins, process/source cleanup, or restoration.
+        let deadline = MonoTime.now() + Duration.second * 3
+        var terminal = true
+        for (value in gates) { try { value.release() } catch (_: Exception) { terminal = false } }
+        for (worker in workers) {
+            let remaining = deadline - MonoTime.now()
+            if (remaining <= Duration.Zero) { terminal = false; continue }
+            try { worker.get(remaining) }
+            catch (_: TimeoutException) { terminal = false }
+            catch (_: Exception) { () }
+        }
+        let remaining = (deadline - MonoTime.now()).toMilliseconds()
+        if (remaining <= 0) { terminal = false }
+        else {
+            try { terminal = shutdownServicePluginHost(timeoutMillis: remaining).ok && terminal }
+            catch (_: Exception) { terminal = false }
+        }
+        let brokerRemaining = (deadline - MonoTime.now()).toMilliseconds()
+        if (brokerRemaining <= 0) { terminal = false }
+        else {
+            try { terminal = shutdownManagedStdioBroker(timeoutMs: brokerRemaining).ok && terminal }
+            catch (_: Exception) { terminal = false }
+        }
+        try { terminal = managedRecoveryStopOwnedChildren((journal.toString(), parent), deadline) && terminal }
+        catch (_: Exception) { terminal = false }
+        try { terminal = sourceTerminal(deadline) && terminal }
+        catch (_: Exception) { terminal = false }
+        let _ = setServicePluginBeforeSupervisorAttachForTest(priorAttach)
+        if (terminal) {
+            for ((key, prior) in priorEnvironment) {
+                try { match (prior) { case Some(value) => setVariable(key, value) case None => removeVariable(key) } }
+                catch (_: Exception) { terminal = false }
+            }
+        }
+        terminal && MonoTime.now() <= deadline
+    }
+}
+
+@When[os == "macOS"]
+private func supervisorOwnedRun(method: String, body: (SupervisorOwnedFixture) -> Unit): Unit {
+    if (let Some(childHome) <- getVariable("METIS_SUPERVISOR_OWNED_HOME")) {
+        let home = canonicalize(Path(childHome))
+        let nonce = getVariable("METIS_SUPERVISOR_OWNED_NONCE").getOrThrow()
+        if (!home.toString().startsWith("/private/tmp/") || mtimeThinText(home.join("binding")) != nonce) {
+            throw Exception("supervisor_fixture_binding_invalid")
+        }
+        let fixture = SupervisorOwnedFixture(home, nonce)
+        var original = None<Exception>
+        var formal = false
+        var proofSaved = false
+        try {
+            for (_ in 0..2) {
+                fixture.register(ServicePluginSupervisorConfig())
+                fixture.start(); fixture.stop()
+            }
+            let fd = mtimeThinCount(1)
+            let tasks = mtimeThinThreadSnapshot()
+            body(fixture)
+            fixture.stable(fd, tasks)
+            formal = !fixture.failed
+        } catch (failure: Exception) { original = Some(failure) }
+        finally {
+            try {
+                File.writeTo(home.join("formal-before-fallback.json"),
+                    ("{\"nonce\":\"${nonce}\",\"formal\":${formal},\"failed\":${fixture.failed},\"recorded\":true}").toArray())
+                proofSaved = true
+            } catch (failure: Exception) { if (original.isNone()) { original = Some(failure) } }
+            finally {
+                let terminal = fixture.finish()
+                if ((!terminal || !proofSaved || !formal) && original.isNone()) {
+                    original = Some(Exception("supervisor_fixture_cleanup_or_formal_pending"))
+                }
+            }
+        }
+        if (let Some(failure) <- original) { throw failure }
+        return
+    }
+    synchronized(MetisProcessEnvironmentLock) {
+        let home = Directory.createTemp("/private/tmp")
+        let nonce = DateTime.now().toUnixTimeStamp().toNanoseconds().toString()
+        File.writeTo(home.join("binding"), nonce.toArray())
+        File.writeTo(home.join("metis.json"), "{}".toArray())
+        print("R-SUPERVISOR fixture=${home.fileName};nonce=${nonce};case=${method}\n", flush: true)
+        let environment = HashMap(getVariables())
+        let aliases = ArrayList<String>()
+        for (descriptor in cliModelProviderCatalogDescriptors()) {
+            for (alias in descriptor.apiKeyEnvAliases) { aliases.add(alias.toAsciiUpper()) }
+        }
+        for (key in environment.keys().toArray()) {
+            let upper = key.toAsciiUpper()
+            if (upper.contains("PROXY") || upper.endsWith("_TOKEN") || upper.endsWith("_API_KEY") ||
+                upper.contains("SECRET") || upper.contains("PASSWORD") || upper.contains("CREDENTIAL") ||
+                upper.endsWith("_ACCESS_KEY_ID") || aliases.contains(upper) || upper.startsWith("METIS_PROCESS_RECOVERY_")) {
+                environment.remove(key)
+            }
+        }
+        environment["METIS_HOME"] = home.toString()
+        environment["HOME"] = home.toString(); environment["TMPDIR"] = home.toString()
+        environment["CURL_HOME"] = home.toString(); environment["XDG_CONFIG_HOME"] = home.toString()
+        environment["METIS_SUPERVISOR_OWNED_HOME"] = home.toString()
+        environment["METIS_SUPERVISOR_OWNED_NONCE"] = nonce
+        environment["METIS_LOG_FILE"] = home.join("child.log").toString()
+        environment["METIS_STDIO_BROKER_NODE_COMMAND"] = managedStdioResolveNodeCommand()
+        environment["METIS_STDIO_BROKER_SCRIPT"] = canonicalize(Path("scripts/metis-stdio-broker.mjs")).toString()
+        var child = None<ManagedOwnedChild>
+        var pendingLaunch = false
+        var childBirth = None<ProcessBirthIdentity>
+        var reaped = false
+        var formal = false
+        var terminal = false
+        var original = None<Exception>
+        try {
+            try (output = File(home.join("stdout"), OpenMode.Write), error = File(home.join("stderr"), OpenMode.Write)) {
+                pendingLaunch = true
+                child = Some(launchManagedRawChild(getCommand(),
+                    ["--filter=ServicePluginSupervisorOwnershipTest." + method, "--parallel=false", "--no-progress",
+                     "--no-color", "--no-capture-output"],
+                    newGeneration: true, environment: Some<Map<String, String>>(environment),
+                    stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.FromFile(output), stdErr: ProcessRedirect.FromFile(error)))
+                pendingLaunch = false
+            }
+            let handle = child.getOrThrow()
+            childBirth = observeProcessBirthIdentity(handle.pid)
+            if (childBirth.isNone()) { throw Exception("supervisor_driver_birth_unknown") }
+            let code = handle.wait(timeout: Some(Duration.second * 60)); reaped = true
+            handle.closeStreams()
+            let proof = JsonValue.fromStr(mtimeThinText(home.join("formal-before-fallback.json"))).asObject()
+            formal = code == 0 && proof.get("nonce").getOrThrow().asString().getValue() == nonce &&
+                proof.get("formal").getOrThrow().asBool().getValue() && proof.get("recorded").getOrThrow().asBool().getValue()
+            if (!formal) { throw Exception("supervisor_child_formal_failed") }
+        } catch (failure: Exception) { original = Some(failure) }
+        finally {
+            try { File.writeTo(home.join("parent-formal-before-fallback"),
+                "formal:${formal}\nreaped:${reaped}\nlaunchPending:${pendingLaunch}\n".toArray()) }
+            catch (failure: Exception) { if (original.isNone()) { original = Some(failure) } }
+            finally {
+                let deadline = MonoTime.now() + Duration.second * 3
+                if (let Some(handle) <- child) {
+                    try {
+                        if (handle.isAlive()) { handle.terminate(force: true) }
+                        let remaining = deadline - MonoTime.now()
+                        if (remaining <= Duration.Zero) { throw Exception("supervisor_parent_cleanup_deadline") }
+                        let _ = handle.wait(timeout: Some(remaining)); reaped = true
+                    } catch (failure: Exception) { if (original.isNone()) { original = Some(failure) } }
+                    finally {
+                        try { handle.closeStreams() }
+                        catch (failure: Exception) { if (original.isNone()) { original = Some(failure) } }
+                    }
+                    try {
+                        let identity = JsonValue.fromStr(mtimeThinText(home.join("child-identity.json"))).asObject()
+                        let originalParent = identity.get("parent").getOrThrow().asString().getValue()
+                        let parsed = parseProcessInstanceIdentity(originalParent).getOrThrow()
+                        let birth = childBirth.getOrThrow()
+                        let bound = identity.get("nonce").getOrThrow().asString().getValue() == nonce &&
+                            parsed.pid == handle.pid && birth.pid == handle.pid &&
+                            parsed.value8 == birth.seconds && parsed.value9 == birth.microseconds
+                        let source = managedRecoveryProbeRecords(home.join("inventory"), originalParent, nonce, deadline)
+                        terminal = !pendingLaunch && bound && source.ok && source.terminal && reaped &&
+                            !handle.isAlive() && handle.streamsAreClosed() && MonoTime.now() <= deadline
+                    } catch (failure: Exception) {
+                        terminal = false
+                        if (original.isNone()) { original = Some(failure) }
+                    }
+                }
+                if (!terminal && original.isNone()) { original = Some(Exception("supervisor_parent_cleanup_pending")) }
+            }
+        }
+        @Expect(formal && terminal && original.isNone(), true)
+        if (formal && terminal && original.isNone()) { remove(home, recursive: true) }
+        if (let Some(failure) <- original) { throw failure }
+    }
+}
+
+@When[os == "macOS"]
+@Test
+public class ServicePluginSupervisorOwnershipTest {
+    @TestCase
+    public func supervisorLongIntervalStopReallyJoins(): Unit {
+        supervisorOwnedRun("supervisorLongIntervalStopReallyJoins", { fixture =>
+            fixture.register(ServicePluginSupervisorConfig())
+            fixture.start()
+            fixture.awaitState({ value => value.waiting == 1 })
+            fixture.stop()
+        })
+    }
+
+    @TestCase
+    public func supervisorStopBeforeFutureAttachRetainsPending(): Unit {
+        supervisorOwnedRun("supervisorStopBeforeFutureAttachRetainsPending", { fixture =>
+            fixture.register(ServicePluginSupervisorConfig())
+            let gate = fixture.gate()
+            let prior = setServicePluginBeforeSupervisorAttachForTest(Some({ _sid: String => gate.enterAndWait() }))
+            try {
+                fixture.workers.add(spawn { let _ = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 2000) })
+                fixture.check(gate.awaitEntered(2000))
+                fixture.check(fixture.state().awaitingAttach == 1)
+                let first = stopServicePlugin("gitcode-monitor", timeoutMillis: 200)
+                fixture.check(!first.ok && first.status == "cleanup_pending")
+                fixture.check(fixture.state().owned == 1 && fixture.state().awaitingAttach == 1)
+                fixture.proof("attach-pending")
+            } finally {
+                fixture.beforeGateRelease("attach-final")
+                gate.release(); let _ = setServicePluginBeforeSupervisorAttachForTest(prior)
+            }
+            fixture.workers[0].get(Duration.second * 2)
+            fixture.stop()
+        })
+    }
+
+    private func recoverThree(fixture: SupervisorOwnedFixture, attachBarrier: Bool): Unit {
+        fixture.register(ServicePluginSupervisorConfig(intervalMs: 200, healthTimeoutMs: 2000,
+            failureThreshold: 1, restartCooldownMs: 0))
+        fixture.start()
+        for (round in 0..3) {
+            let old = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+            let oldToken = fixture.state().currentToken
+            let successorToken = Array<Int64>(1, repeat: 0)
+            let gate = fixture.gate()
+            let prior = setServicePluginBeforeSupervisorAttachForTest(
+                if (attachBarrier) { Some({ _sid: String => gate.enterAndWait() }) } else { None<(String) -> Unit> })
+            try {
+                let oldBirth = observeProcessBirthIdentity(old.pid).getOrThrow()
+                fixture.check(observeProcessBirthIdentity(old.pid)?.serialize() == Some(oldBirth.serialize()))
+                let killed = managedRecoveryExecuteWithOutput("/bin/kill", ["-KILL", old.pid.toString()])
+                fixture.check(killed[0] == 0)
+                if (attachBarrier) {
+                    fixture.check(gate.awaitEntered(2000))
+                    let handoff = fixture.state()
+                    fixture.check(handoff.owned == 2 && handoff.currentToken > 0 &&
+                        handoff.currentToken != oldToken && handoff.awaitingAttach == 1)
+                    successorToken[0] = handoff.currentToken
+                    fixture.proof("handoff-${round}")
+                    fixture.beforeGateRelease("handoff-open-${round}")
+                    gate.release()
+                }
+                fixture.awaitState({ value => value.owned == 1 && value.awaitingAttach == 0 && value.currentToken > 0 &&
+                    value.currentToken != oldToken && (!attachBarrier || value.currentToken == successorToken[0]) })
+                let next = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                fixture.check(next.pid > 0 && next.pid != old.pid && next.instanceId != old.instanceId)
+                fixture.check(next.supervisorRestartCount == round + 1)
+                fixture.check(fixture.state().currentToken > 0 && fixture.state().currentToken != oldToken)
+                if (attachBarrier) { fixture.check(fixture.state().currentToken == successorToken[0]) }
+                fixture.proof("recovered-${round}")
+            } finally {
+                fixture.beforeGateRelease("handoff-final-${round}")
+                gate.release(); let _ = setServicePluginBeforeSupervisorAttachForTest(prior)
+            }
+        }
+        fixture.stop()
+    }
+
+    @TestCase
+    public func supervisorOldCompletionNeverRemovesSuccessor(): Unit {
+        supervisorOwnedRun("supervisorOldCompletionNeverRemovesSuccessor", { fixture => recoverThree(fixture, true) })
+    }
+
+    @TestCase
+    public func supervisorSlowTickStaysOwnedUntilRetry(): Unit {
+        supervisorOwnedRun("supervisorSlowTickStaysOwnedUntilRetry", { fixture =>
+            fixture.register(ServicePluginSupervisorConfig(intervalMs: 200))
+            let gate = fixture.gate()
+            let calls = ServicePluginTestCounter()
+            setServicePluginHealthzProbeForTest(Some({ _url: String, _timeout: Int64 =>
+                calls.increment(); gate.enterAndWait(); ServicePluginHealthzProbeResult(true, statusCode: 200) }))
+            fixture.start()
+            try {
+                fixture.check(gate.awaitEntered(2000))
+                let stopped = stopServicePlugin("gitcode-monitor", timeoutMillis: 200)
+                fixture.check(!stopped.ok && stopped.status == "cleanup_pending" && fixture.state().owned == 1)
+                let before = calls.get()
+                let manual = runServicePluginSupervisorTickForTest("gitcode-monitor")
+                fixture.check(!manual.ok && manual.status == "cleanup_pending" && calls.get() == before)
+                fixture.proof("slow-tick-pending")
+            } finally {
+                fixture.beforeGateRelease("slow-tick-final")
+                gate.release()
+            }
+            fixture.stop()
+        })
+    }
+
+    @TestCase
+    public func supervisorSelfRecoveryNeverJoinsItsOwnFuture(): Unit {
+        supervisorOwnedRun("supervisorSelfRecoveryNeverJoinsItsOwnFuture", { fixture => recoverThree(fixture, false) })
+    }
+
+    @TestCase
+    public func hostShutdownAndResetRetainUnfinishedSupervisor(): Unit {
+        supervisorOwnedRun("hostShutdownAndResetRetainUnfinishedSupervisor", { fixture =>
+            for (slow in [false, true]) {
+                let firstId = "sup-attach-a"
+                let secondId = "sup-attach-b"
+                if (slow) { fixture.register(ServicePluginSupervisorConfig(intervalMs: 200)) }
+                else {
+                    fixture.register(ServicePluginSupervisorConfig(), serviceId: firstId)
+                    fixture.register(ServicePluginSupervisorConfig(), serviceId: secondId, reset: false)
+                }
+                let gate = fixture.gate()
+                let secondGate = fixture.gate()
+                let prior = setServicePluginBeforeSupervisorAttachForTest(
+                    if (!slow) {
+                        Some({ sid: String =>
+                            if (sid == firstId) { gate.enterAndWait() }
+                            else if (sid == secondId) { secondGate.enterAndWait() }
+                            else { throw Exception("supervisor_attach_service_unexpected") }
+                        })
+                    } else { None<(String) -> Unit> })
+                try {
+                    if (slow) {
+                        setServicePluginHealthzProbeForTest(Some({ _url: String, _timeout: Int64 =>
+                            gate.enterAndWait(); ServicePluginHealthzProbeResult(true, statusCode: 200) }))
+                        fixture.start()
+                    } else {
+                        fixture.workers.add(spawn { let _ = startServicePlugin(firstId) })
+                        fixture.workers.add(spawn { let _ = startServicePlugin(secondId) })
+                    }
+                    fixture.check(gate.awaitEntered(2000))
+                    if (!slow) {
+                        fixture.check(secondGate.awaitEntered(2000))
+                        fixture.check(servicePluginSupervisorWorkerCountForTest() == 2)
+                    }
+                    let stopped = shutdownServicePluginHost(timeoutMillis: 200)
+                    fixture.check(!stopped.ok && stopped.status == "cleanup_pending")
+                    if (!slow) {
+                        fixture.check(fixture.state(serviceId: firstId).owned == 1 &&
+                            fixture.state(serviceId: secondId).owned == 1 && servicePluginSupervisorWorkerCountForTest() == 2)
+                        fixture.check(servicePluginActiveIdentityForTest(firstId).isNone() &&
+                            servicePluginActiveIdentityForTest(secondId).isNone() && servicePluginCleanupPendingCountForTest() == 0)
+                        let firstRecord = getServicePluginSnapshot(firstId).getOrThrow()
+                        let secondRecord = getServicePluginSnapshot(secondId).getOrThrow()
+                        fixture.check(firstRecord.pid == 0 && secondRecord.pid == 0 &&
+                            firstRecord.status == "stopped" && secondRecord.status == "stopped")
+                    }
+                    let resetStarted = MonoTime.now()
+                    var pending = false
+                    try { resetServicePluginHostForTest() }
+                    catch (failure: Exception) { pending = failure.message == "service_plugin_test_reset_supervisor_cleanup_pending" }
+                    let resetElapsed = MonoTime.now() - resetStarted
+                    if (slow) {
+                        fixture.check(pending && fixture.state().owned > 0)
+                        fixture.proof("reset-slow-pending")
+                    } else {
+                        let first = fixture.state(serviceId: firstId)
+                        let second = fixture.state(serviceId: secondId)
+                        fixture.check(pending && servicePluginSupervisorWorkerCountForTest() == 2)
+                        fixture.check(first.owned == 1 && second.owned == 1 &&
+                            first.awaitingAttach == 1 && second.awaitingAttach == 1)
+                        fixture.check(first.currentToken > 0 && second.currentToken > 0 &&
+                            first.currentToken != second.currentToken)
+                        // Auxiliary discriminator only: the production phase remains
+                        // one shared1000ms; this includes scheduler/metadata overhead.
+                        fixture.check(resetElapsed < Duration.second * 2)
+                        File.writeTo(fixture.home.join("reset-two-attach-pending.json"),
+                            ("{\"nonce\":\"${fixture.nonce}\",\"resetElapsedMs\":${resetElapsed.toMilliseconds()}," +
+                             "\"firstToken\":${first.currentToken},\"secondToken\":${second.currentToken}," +
+                             "\"firstOwned\":${first.owned},\"secondOwned\":${second.owned}," +
+                             "\"firstAwaitingAttach\":${first.awaitingAttach},\"secondAwaitingAttach\":${second.awaitingAttach}}").toArray())
+                    }
+                } finally {
+                    fixture.beforeGateRelease(if (slow) { "reset-slow-final" } else { "reset-two-attach-final" },
+                        serviceIds: if (slow) { ["gitcode-monitor"] } else { [firstId, secondId] })
+                    gate.release(); secondGate.release()
+                    let _ = setServicePluginBeforeSupervisorAttachForTest(prior)
+                }
+                for (worker in fixture.workers) { worker.get(Duration.second * 2) }
+                if (slow) { fixture.stop() }
+                resetServicePluginHostForTest()
+                fixture.check(fixture.state().owned == 0 && servicePluginSupervisorWorkerCountForTest() == 0)
+                if (!slow) {
+                    fixture.check(fixture.state(serviceId: firstId).owned == 0 && fixture.state(serviceId: secondId).owned == 0)
+                }
+            }
+        })
     }
 }
