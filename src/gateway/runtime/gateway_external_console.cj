@@ -4,8 +4,10 @@ import metis.core.config.{CliConfig, CliSettingManager}
 import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import metis.io.PrintUtils
 import metis.utils.InfoUtils
+import metis.process.launchManagedRawChild
 
-import std.env.getVariable
+import std.env.{getVariable, getVariables}
+import std.collection.HashMap
 import std.fs.{File, Path, canonicalize, exists}
 import std.process.*
 import std.time.DateTime
@@ -164,15 +166,22 @@ public func gatewayLaunchDedicatedConsole(): Bool {
         let script =
             "cd \"${cwd}\" && " +
             "nohup /bin/zsh -lc 'source \"${envsetup}\" && ${opensslLibExport} && ${tlsCaExport} && rtk cjpm run --skip-script --skip-build --name metis --run-args \"gateway serve\"' >> \"${logStr}\" 2>&1 &"
-        let proc = launch(
+        let environment = HashMap<String, String>(getVariables())
+        for (name in ["METIS_PROCESS_RECOVERY_DIRECTORY", "METIS_PROCESS_RECOVERY_PARENT",
+            "METIS_PROCESS_RECOVERY_BROKER_KEY", "METIS_PROCESS_RECOVERY_OWNER_PID", "METIS_PROCESS_RECOVERY_OWNER_BIRTH"]) {
+            environment.remove(name)
+        }
+        let proc = launchManagedRawChild(
             "/bin/sh",
             ["-c", script],
+            environment: environment,
+            newGeneration: true,
             stdIn: Inherit,
             stdOut: Inherit,
             stdErr: Inherit
         )
-        let _ec2 = proc.wait()
-        PrintUtils.printLine("[网关] 已在后台启动网关进程，日志: ${logStr}")
+        try { let _ec2 = proc.wait() } finally { proc.closeStreams() }
+        PrintUtils.printLine("[网关] 已请求在后台启动网关，正在等待就绪；日志: ${logStr}")
         gatewayLaunchTimingLog("nohup-launch-done", startMs)
         return true
     } catch (e: Exception) {

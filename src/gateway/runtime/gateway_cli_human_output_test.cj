@@ -165,6 +165,10 @@ public class GatewayCliHumanOutputTest {
             for (key in ["\"ok\"", "\"result\"", "\"image\"", "\"schedule\"", "\"sessions\"", "{", "synthetic-secret", "/Users/synthetic/private"]) { @Expect(text.contains(key), false) }
             @Expect(text.contains("主进程已退出"), false)
             if (status == "recoverable") { @Expect(text.contains("启动时将重新核验并归档"), true) }
+            else if (["unsafe_path", "evidence_limit_exceeded"].contains(status)) {
+                @Expect(text.contains("历史资源证据无法安全读取或核验"), true)
+                @Expect(text.contains("已拒绝启动并保留原始记录"), true)
+            }
             else if (!["lease_active", "pid_alive", "identity_alive"].contains(status)) { @Expect(text.contains("无法确认"), true) }
             else { @Expect(text.contains("仍有进程"), true) }
         }
@@ -178,7 +182,9 @@ public class GatewayCliHumanOutputTest {
         let stale = gatewayStopOutcomeHumanText("stale_identity")
         @Expect(graceful.contains("已正常停止"), true)
         @Expect(forced.contains("已强制停止"), true)
-        @Expect(pending.contains("主进程已退出但子进程清理未完成"), true)
+        @Expect(pending.contains("关闭流程尚未确认所有资源终态，已保留清理记录"), true)
+        @Expect(pending.contains("主进程已退出"), false)
+        @Expect(pending.contains("仍有进程"), false)
         @Expect(stale.contains("替代进程"), true)
         for (text in [graceful, forced, pending, stale]) {
             @Expect(text.contains("\"ok\""), false)

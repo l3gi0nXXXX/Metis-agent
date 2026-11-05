@@ -1,5 +1,9 @@
 package metis.gateway.runtime
 
+import metis.process.managedRecoveryExecuteHandoffWithOutput
+
+import metis.process.{ProcessFileClaim, probeProcessInstance, acquireProcessFileClaim, managedRecoveryReadText, publishExclusiveUtf8File, syncFileDirectory}
+
 import magic.jsonable.*
 import metis.core.gatewayImageUnderstandingDiagnosticSnapshot
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisPaths, GatewayUserSettings}
@@ -17,7 +21,7 @@ import magic.config.Config
 import std.collection.{collectArray, filter, map}
 import std.collection.ArrayList
 import std.env.{getVariable, setVariable}
-import std.fs.{Path, exists}
+import std.fs.{Path, exists, remove, rename}
 import std.process.executeWithOutput
 import std.time.{DateTime, MonoTime}
 import std.core.Duration
@@ -989,14 +993,14 @@ private func gatewayDashboardShellSingleQuote(raw: String): String {
 private func gatewayDashboardTryCopy(url: String): Bool {
     let (exitCode, _, _) = match (InfoUtils.os) {
         case "macos" =>
-            executeWithOutput(
+            managedRecoveryExecuteHandoffWithOutput(
                 "osascript",
                 ["-e", "on run argv", "-e", "set the clipboard to (item 1 of argv)", "-e", "end run", url],
                 workingDirectory: CliConfig.cwd
             )
         case "linux" =>
             let escaped = gatewayDashboardShellSingleQuote(url)
-            let xclip = executeWithOutput(
+            let xclip = managedRecoveryExecuteHandoffWithOutput(
                 "sh",
                 ["-lc", "printf %s ${escaped} | xclip -selection clipboard"],
                 workingDirectory: CliConfig.cwd
@@ -1004,14 +1008,14 @@ private func gatewayDashboardTryCopy(url: String): Bool {
             if (xclip[0] == 0) {
                 xclip
             } else {
-                executeWithOutput(
+                managedRecoveryExecuteHandoffWithOutput(
                     "sh",
                     ["-lc", "printf %s ${escaped} | wl-copy"],
                     workingDirectory: CliConfig.cwd
                 )
             }
         case "windows" =>
-            executeWithOutput(
+            managedRecoveryExecuteHandoffWithOutput(
                 "powershell",
                 ["-NoProfile", "-Command", "Set-Clipboard -Value $args[0]", url],
                 workingDirectory: CliConfig.cwd
@@ -1034,9 +1038,9 @@ private func gatewayDashboardOpenHint(url: String): String {
 
 private func gatewayDashboardTryOpen(url: String): Bool {
     let (exitCode, _, _) = match (InfoUtils.os) {
-        case "macos" => executeWithOutput("open", [url], workingDirectory: CliConfig.cwd)
-        case "linux" => executeWithOutput("xdg-open", [url], workingDirectory: CliConfig.cwd)
-        case "windows" => executeWithOutput("rundll32", ["url.dll,FileProtocolHandler", url], workingDirectory: CliConfig.cwd)
+        case "macos" => managedRecoveryExecuteHandoffWithOutput("open", [url], workingDirectory: CliConfig.cwd)
+        case "linux" => managedRecoveryExecuteHandoffWithOutput("xdg-open", [url], workingDirectory: CliConfig.cwd)
+        case "windows" => managedRecoveryExecuteHandoffWithOutput("rundll32", ["url.dll,FileProtocolHandler", url], workingDirectory: CliConfig.cwd)
         case _ => (-1, Array<Byte>(), Array<Byte>())
     }
     exitCode == 0
@@ -1395,10 +1399,21 @@ private func runGatewayStopSubcommand(): Int64 {
         stopPids |> map({p => p.toString()}) |> collectArray,
         delimiter: ","
     )
-    gatewayStopPrintLine("[网关] 正在停止 gateway serve（PID=${stopPidText}）…")
+    let historicalMissing = match (gatewayReadServeIdentity()) {
+        case Some(identity) =>
+            if (exists(gatewayServeCompletionPath()) || identity.processIdentity.isNone()) { false }
+            else {
+                let checked = probeProcessInstance(identity.processIdentity.getOrThrow(), deadline)
+                checked.conclusive && !checked.alive
+            }
+        case None => false
+    }
+    gatewayStopPrintLine(if (historicalMissing) { "[网关] 正在核验异常退出后的历史资源（PID=${stopPidText}）…" }
+        else { "[网关] 正在停止 gateway serve（PID=${stopPidText}）…" })
     gatewayCliTimingLog("stop", "terminate-begin", startMs)
     let failed = ArrayList<Int64>()
     var forced = false
+    var recoveredAfterCrash = false
     var failureStatus = "cleanup_pending"
     var failurePhase = "unknown"
     let stopResults = gatewayStopTargetsWithinDeadline(
@@ -1415,11 +1430,13 @@ private func runGatewayStopSubcommand(): Int64 {
             failurePhase = stopped.shutdownPhase
         } else if (stopped.status == "force_terminated") {
             forced = true
+        } else if (stopped.status == "recovered_after_crash") {
+            recoveredAfterCrash = true
         }
     }
     if (failed.isEmpty()) {
         gatewayRuntimeMarkStoppedFromCli(reason: "stopped")
-        gatewayStopPrintLine(gatewayStopOutcomeHumanText(if (forced) { "force_terminated" } else { "graceful" }))
+        gatewayStopPrintLine(gatewayStopOutcomeHumanText(if (recoveredAfterCrash) { "recovered_after_crash" } else if (forced) { "force_terminated" } else { "graceful" }))
         gatewayCliTimingLog("stop", "terminate-done", startMs)
         return 0
     }
@@ -1453,11 +1470,21 @@ public func gatewayStopOutcomeHumanText(status: String): String {
     match (status.trimAscii()) {
         case "graceful" => "[网关] 已正常停止。"
         case "force_terminated" => "[网关] 已强制停止。"
+        case "recovered_after_crash" => "[网关] 异常退出后的历史资源已核验并归档。"
+        case "legacy_inventory_missing" => "[网关] 旧版记录缺少资源清单，无法证明历史子进程均已结束；已保留原始记录。"
+        case "resource_alive" | "resource_group_active_or_unknown" => "[网关] 历史后台进程仍活动或进程组状态无法确认，已拒绝启动。"
+        case "resource_intent_incomplete" | "resource_identity_unknown" | "inventory_invalid" | "inventory_identity_mismatch" |
+            "lock_invalid" | "checkpoint_invalid" | "checkpoint_owner_missing" | "resource_intent_missing" |
+            "stop_request_invalid" | "stop_request_identity_mismatch" => "[网关] 历史资源所有权记录不完整或身份无法确认，已拒绝启动并保留原始记录。"
+        case "recovery_deadline_exceeded" | "deadline_exceeded" => "[网关] 历史资源核验等待超时，已拒绝启动并保留原始记录。"
+        case "claim_failed" | "claim_timeout" | "recovery_claim_failed" => "[网关] 历史资源恢复互斥未取得，已拒绝启动并保留原始记录。"
+        case "archive_write_failed" | "recovery_commit_failed" | "stop_request_retirement_failed" => "[网关] 历史资源归档或恢复提交失败，已拒绝启动并保留原始记录。"
+        case "unsafe_path" | "inventory_read_failed" | "probe_failed" | "permission_denied" | "evidence_limit_exceeded" => "[网关] 历史资源证据无法安全读取或核验，已拒绝启动并保留原始记录。"
         case "stale_identity" => "[网关] 停止目标身份已变化，未向替代进程发送强制信号。"
         case "recoverable" => "[网关] 未发现存活的旧网关资源，历史清理失败记录可恢复；启动时将重新核验并归档。"
         case "identity_alive" | "pid_alive" | "lease_active" | "port_active" | "resources_active" => "[网关] 仍有进程或监听端口活动，已拒绝启动；历史记录保持不变。"
         case "resources_unknown" | "resources_not_terminal" | "lease_evidence_missing" | "invalid_response_encoding" | "malformed" => "[网关] 无法确认历史资源已全部停止，已拒绝启动；请检查清理诊断。"
-        case "cleanup_pending" => "[网关] 主进程已退出但子进程清理未完成。"
+        case "cleanup_pending" => "[网关] 关闭流程尚未确认所有资源终态，已保留清理记录。"
         case _ => "[网关] 无法确认历史资源已全部停止，已拒绝启动；请检查清理诊断。"
     }
 }
@@ -1468,7 +1495,44 @@ public func gatewayExecuteStopServe(): Int64 {
 }
 
 /** 与命令行 `gateway restart` 相同逻辑。 */
-public func gatewayExecuteRestartServe(launchServe!: () -> Bool = { => gatewayLaunchDedicatedConsole() }): Int64 {
+public func gatewayExecuteRestartServe(launchServe!: () -> Bool = { => gatewayLaunchDedicatedConsole() },
+    awaitReady!: () -> Bool = { => gatewayAwaitRestartReady(MonoTime.now() + Duration.second * 30) }): Int64 {
+    let observedNonce = match (gatewayReadServeIdentity()) { case Some(value) => value.nonce case None => "" }
+    let epochPath = CliConfig.dotDir.join("gateway-restart.completed")
+    let observedEpoch = managedRecoveryReadText(epochPath).getOrDefault({ => "" })
+    PrintUtils.printString("[网关] 正在核验并等待网关重启互斥…\n")
+    let claim = if (gatewayCrashRecoveryPlatformSupported()) {
+        acquireProcessFileClaim(CliConfig.dotDir.join("gateway-serve.restart-claim"), MonoTime.now() + Duration.second * 90)
+    } else { ProcessFileClaim(true, "legacy_platform") }
+    if (!claim.ok) {
+        PrintUtils.printLine("[网关] 另一个重启操作尚未完成，请稍后检查网关就绪状态。")
+        return 1
+    }
+    try {
+        let currentNonce = match (gatewayReadServeIdentity()) { case Some(value) => value.nonce case None => "" }
+        let epochChanged = managedRecoveryReadText(epochPath).getOrDefault({ => "" }) != observedEpoch
+        if (!currentNonce.isEmpty() && (currentNonce != observedNonce || epochChanged) &&
+            gatewayAwaitRestartReady(MonoTime.now() + Duration.millisecond * 500, previousNonce: if (epochChanged) { "" } else { observedNonce })) {
+            PrintUtils.printLine("[网关] 并发重启已完成，新一代网关已就绪。")
+            return 0
+        }
+        let result = gatewayExecuteRestartUnderClaim(launchServe, awaitReady)
+        if (result == 0 && gatewayCrashRecoveryPlatformSupported()) {
+            let epoch = "gateway-restart-completed-v1\ncompletedAtNs:${DateTime.now().toUnixTimeStamp().toNanoseconds()}\n"
+            let temporary = Path("${epochPath.toString()}.tmp-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            if (publishExclusiveUtf8File(temporary, epoch).ok) {
+                try { rename(temporary, to: epochPath, overwrite: true); let _ = syncFileDirectory(epochPath.parent) }
+                catch (_: Exception) { try { remove(temporary) } catch (_: Exception) { () } }
+            }
+        }
+        result
+    } catch (_: Exception) {
+        PrintUtils.printLine("[网关] 重启操作未能完成，已保留诊断记录。")
+        1
+    } finally { claim.release() }
+}
+
+private func gatewayExecuteRestartUnderClaim(launchServe: () -> Bool, awaitReady: () -> Bool): Int64 {
     let startMs = gatewayCliNowMs()
     gatewayCliTimingLog("restart", "enter", startMs)
     match (gatewayRestartConfigValidationMessage()) {
@@ -1487,11 +1551,16 @@ public func gatewayExecuteRestartServe(launchServe!: () -> Bool = { => gatewayLa
     PrintUtils.printLine("[网关] 正在另开窗口启动 gateway serve …")
     let launched = launchServe()
     gatewayCliTimingLog("restart", if (launched) { "launch-done" } else { "launch-failed" }, startMs)
-    return if (launched) {
-        0
-    } else {
-        1
+    if (!launched) {
+        PrintUtils.printLine("[网关] 新一代网关启动请求失败，尚未确认就绪。")
+        return 1
     }
+    if (!awaitReady()) {
+        PrintUtils.printLine("[网关] 已提交启动请求，但新一代网关未在期限内确认就绪。")
+        return 1
+    }
+    PrintUtils.printLine("[网关] 新一代网关已就绪。")
+    0
 }
 
 /**
