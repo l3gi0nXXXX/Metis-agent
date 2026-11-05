@@ -612,6 +612,23 @@ public class GatewayGcmShutdownE2eTest {
                     @Expect(deliveries.count(deliveryId), 1)
 
                     let stopped = stopServicePlugin("gitcode-monitor", reason: "s5-b1-${round}", timeoutMillis: 5000)
+                    if (!stopped.ok) {
+                        let fixed = { value: String =>
+                            if (["stopped", "cleanup_pending", "stopping", "degraded", "running", "stale_owner",
+                                "sent", "write_failed", "deadline_exhausted", "not_started", "drained", "cancelled",
+                                "dispatch_pending", "graceful_exited", "force_terminated", "terminated", "still_alive",
+                                "already_stopped", "not_applicable", "not_checked", "not_stopped", "invalid",
+                                "identity_mismatch", "released", "not_released", "pid_probe_timeout", "port_probe_timeout",
+                                "lease_probe_timeout"].contains(value)) { value } else { "other" }
+                        }
+                        try {
+                            let after = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                            let state = managedStdioBroker().snapshot()
+                            println("S5_STOP_FIXED round=${round} ok=false status=${fixed(stopped.status)} ingress=${fixed(stopped.ingressStopStatus)} dispatch=${fixed(stopped.dispatchStatus)} owner=${fixed(stopped.ownerStopStatus)} lease=${fixed(stopped.leaseStatus)} port=${fixed(stopped.portStatus)} pumpPending=${stopped.diagnostic.contains("event_pump_join_pending")} identityChanged=${stopped.diagnostic.contains("cleanup_identity_changed")} supervisorPending=${stopped.diagnostic.contains("supervisor_cleanup_pending")} pendingIdentity=${stopped.diagnostic.contains("cleanup owner identity changed")} publishIdentity=${stopped.diagnostic.contains("cleanup finalized but service identity changed")} recordStatus=${fixed(after.status)} sameInstance=${after.instanceId == snapshot.instanceId} pidPositive=${after.pid > 0} pending=${servicePluginCleanupPendingCountForTest()} owners=${state.ownerCount} sampled=true")
+                        } catch (_: Exception) {
+                            println("S5_STOP_FIXED round=${round} sampled=false")
+                        }
+                    }
                     @Expect(stopped.ok, true)
                     @Expect(stopped.status, "stopped")
                     @Expect(stopped.ingressStopStatus, "sent")

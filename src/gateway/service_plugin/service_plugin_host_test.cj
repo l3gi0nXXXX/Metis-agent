@@ -15,6 +15,7 @@ import std.posix.chmod
 import stdx.encoding.json.*
 import metis.core.config.MetisProcessEnvironmentLock
 import metis.process.ManagedOwnedChild
+import metis.process.captureCurrentProcessFdSnapshot
 import metis.process.managedStdioResolveNodeCommand
 import metis.process.parseProcessInstanceIdentity
 import metis.process.ProcessBirthIdentity
@@ -6556,6 +6557,356 @@ public class ServicePluginHostTest {
         }
     }
 
+    private func stopMonoRequire(value: Bool, status: String): Unit {
+        @Expect(value, true)
+        if (!value) { throw Exception(status) }
+    }
+
+    public func stopGraceActualOwnerConfirmation(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = Directory.createTemp("/private/tmp")
+            chmod(home.toString(), UInt32(0o700))
+            let oldHome = getVariable("METIS_HOME")
+            let oldLogFile = Config.logFile
+            let readerGate = ServicePluginTestGate()
+            let ingressGate = ServicePluginTestGate()
+            let gracefulGate = ServicePluginTestGate()
+            let ownerStoppedGate = ServicePluginTestGate()
+            let callbackLock = Mutex()
+            let callbackResults = ArrayList<Bool>()
+            let readerProbes = ArrayList<() -> Bool>()
+            let cleanupErrors = ArrayList<Exception>()
+            let attempt = { action: () -> Unit =>
+                try { action() } catch (error: Exception) { cleanupErrors.add(error) }
+            }
+            var previousPhase = None<(String, String) -> Unit>
+            var stopFuture = None<Future<ServiceStopResult>>
+            var bodyError = None<Exception>
+            var formal = false
+            var gracefulObserved = false
+            var callbackObserved = false
+            var nativeGone = false
+            var stopReturned = false
+            try {
+                setVariable("METIS_HOME", home.toString())
+                CliConfig.invalidatePathCache()
+                let marker = JsonObject()
+                marker.put("schema", JsonString("metis.stopGraceFixture.v1"))
+                marker.put("testPid", JsonInt(Int64(getProcessId())))
+                marker.put("testName", JsonString("stopGraceU1GracefulExitWaitsForActualReaderSettlement"))
+                marker.put("nonce", JsonString(home.fileName))
+                File.writeTo(home.join("owner.json"), marker.toJsonString().toArray())
+                chmod(home.join("owner.json").toString(), UInt32(0o600))
+                resetServicePluginHostForTest()
+                this.stopMonoRequire(resetManagedStdioBrokerForTest(timeoutMs: 2000).ok, "stop_grace_initial_broker_pending")
+                for (_ in 0..2) {
+                    // Keep the warm owner alive until the real broker stop: this does not exercise the target graceful shortcut.
+                    this.registerGitCodeStdioScript("printf '%s\\n' '${this.gitCodeInitLine()}'; trap 'exit 0' TERM; while IFS= read -r request; do :; done")
+                    setServicePluginSupervisorAutoStartForTest(false)
+                    this.stopMonoRequire(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok,
+                        "stop_grace_warm_start_failed")
+                    this.stopMonoRequire(stopServicePlugin("gitcode-monitor", reason: "stop-grace-warm", timeoutMillis: 3000).ok,
+                        "stop_grace_warm_stop_failed")
+                    this.stopMonoRequire(resetManagedStdioBrokerForTest(timeoutMs: 2000).ok, "stop_grace_warm_broker_pending")
+                }
+                let sampleFd = { =>
+                    let snapshot = captureCurrentProcessFdSnapshot()
+                    this.stopMonoRequire(snapshot.status == "ok", "stop_grace_fd_unknown")
+                    snapshot.fdCount
+                }
+                let baselineFd = sampleFd()
+                let baselineThreads = (getThreadCount(), getBlockingThreadCount())
+                let threadsWithin = { =>
+                    getThreadCount() <= baselineThreads[0] && getBlockingThreadCount() <= baselineThreads[1]
+                }
+                this.registerGitCodeStdioScript(this.gitCodeLeaseScript(this.r2UnusedListenerPort()))
+                setServicePluginSupervisorAutoStartForTest(false)
+                this.stopMonoRequire(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok,
+                    "stop_grace_start_failed")
+                let before = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                let owner = servicePluginActiveIdentityForTest("gitcode-monitor").getOrThrow()[0]
+                let birth = observeProcessBirthIdentity(before.pid).getOrThrow()
+                setServicePluginBeforeReaderEndHookForTest(Some({ observed: String, probe: () -> Bool =>
+                    if (observed == owner) { synchronized(callbackLock) { readerProbes.add(probe) } }
+                }))
+                previousPhase = setServicePluginStopMonotonicPhaseHookForTest(Some({ observed: String, phase: String =>
+                    if (observed == owner && phase == "terminal_reader_end") { readerGate.enterAndWait() }
+                    if (observed == owner && phase == "graceful_confirm") { gracefulGate.signal() }
+                }))
+                setServicePluginAfterIngressStopHookForTest(Some({ => ingressGate.enterAndWait() }))
+                setServicePluginAfterOwnerStopHookForTest(Some({ observed: String, ok: Bool, _status: String =>
+                    if (observed == owner) {
+                        synchronized(callbackLock) { callbackResults.add(ok) }
+                        ownerStoppedGate.signal()
+                        readerGate.release()
+                    }
+                }))
+                let operationDeadline = MonoTime.now() + Duration.millisecond * 3000
+                let remainingMs = { =>
+                    let remaining = operationDeadline - MonoTime.now()
+                    if (remaining <= Duration.Zero || remaining.toMilliseconds() <= 0) {
+                        throw Exception("stop_grace_operation_deadline")
+                    }
+                    remaining.toMilliseconds()
+                }
+                stopFuture = Some(spawn { stopServicePlugin("gitcode-monitor", reason: "stop-grace-reader", timeoutMillis: 3000) })
+                this.stopMonoRequire(ingressGate.awaitEntered(min(2000, remainingMs())), "stop_grace_ingress_not_entered")
+                this.stopMonoRequire(readerGate.awaitEntered(min(2000, remainingMs())), "stop_grace_terminal_reader_not_entered")
+                let reader = synchronized(callbackLock) {
+                    if (readerProbes.isEmpty()) { throw Exception("stop_grace_reader_probe_missing") }
+                    readerProbes[readerProbes.size - 1]
+                }
+                this.stopMonoRequire(!reader(), "stop_grace_reader_was_not_held")
+                let gone = probeProcessBirthIdentity(birth, operationDeadline)
+                nativeGone = gone.conclusive && !gone.alive
+                this.stopMonoRequire(nativeGone, "stop_grace_native_birth_not_gone")
+                let leasePath = home.join("service-plugin").join("runtime").join("gitcode-monitor").join(before.instanceId + ".lease.json")
+                let leaseRead = servicePluginReadHistoricalLeaseStrict(leasePath)
+                this.stopMonoRequire(leaseRead.evidence.isSome(), "stop_grace_lease_invalid")
+                let lease = leaseRead.evidence.getOrThrow()
+                this.stopMonoRequire(lease.state == "stopped" && lease.pid == before.pid &&
+                    lease.parentPid == Int64(getProcessId()) && lease.sessionId == before.instanceId,
+                    "stop_grace_lease_binding_invalid")
+                ingressGate.release()
+                gracefulObserved = gracefulGate.awaitEntered(min(2000, remainingMs()))
+                this.stopMonoRequire(gracefulObserved, "stop_grace_branch_not_confirmed")
+                callbackObserved = ownerStoppedGate.awaitEntered(remainingMs())
+                this.stopMonoRequire(callbackObserved, "stop_grace_owner_stop_callback_missing")
+                this.stopMonoRequire(synchronized(callbackLock) { callbackResults.size == 1 && callbackResults[0] },
+                    "stop_grace_broker_owner_stop_not_ok")
+                let remaining = operationDeadline - MonoTime.now()
+                this.stopMonoRequire(remaining > Duration.Zero, "stop_grace_operation_deadline")
+                let result = stopFuture.getOrThrow().get(remaining)
+                stopFuture = None<Future<ServiceStopResult>>
+                stopReturned = true
+                this.stopMonoRequire(MonoTime.now() <= operationDeadline && result.ok && result.status == "stopped" &&
+                    result.ownerStopStatus == "graceful_exited", "stop_grace_final_stop_not_certified")
+                this.stopMonoRequire(reader(), "stop_grace_reader_not_settled")
+                this.stopMonoRequire(servicePluginCleanupPendingCountForTest() == 0 &&
+                    managedStdioBroker().snapshot().ownerCount == 0, "stop_grace_owner_resources_pending")
+                this.stopMonoRequire(resetManagedStdioBrokerForTest(timeoutMs: 2000).ok, "stop_grace_broker_close_pending")
+                let resourceDeadline = MonoTime.now() + Duration.second * 2
+                while (MonoTime.now() < resourceDeadline && (sampleFd() != baselineFd || !threadsWithin())) {
+                    sleep(Duration.millisecond * 5)
+                }
+                this.stopMonoRequire(sampleFd() == baselineFd && threadsWithin(), "stop_grace_resource_baseline_changed")
+                formal = true
+            } catch (error: Exception) { bodyError = Some(error) } finally {
+                // A failed receipt must never bypass releasing or joining any returned owner operation.
+                let formalBeforeFallback = formal
+                let gracefulBeforeFallback = gracefulObserved
+                let callbackBeforeFallback = callbackObserved
+                let nativeGoneBeforeFallback = nativeGone
+                let stopReturnedBeforeFallback = stopReturned
+                attempt({ =>
+                    let proof = JsonObject()
+                    proof.put("schema", JsonString("metis.stopGraceBeforeFallback.v1"))
+                    proof.put("testPid", JsonInt(Int64(getProcessId())))
+                    proof.put("nonce", JsonString(home.fileName))
+                    proof.put("formal", JsonBool(formalBeforeFallback))
+                    proof.put("gracefulObserved", JsonBool(gracefulBeforeFallback))
+                    proof.put("callbackObserved", JsonBool(callbackBeforeFallback))
+                    proof.put("nativeBirthGone", JsonBool(nativeGoneBeforeFallback))
+                    proof.put("stopReturned", JsonBool(stopReturnedBeforeFallback))
+                    File.writeTo(home.join("formal-before-fallback.json"), proof.toJsonString().toArray())
+                    chmod(home.join("formal-before-fallback.json").toString(), UInt32(0o600))
+                })
+                let cleanupDeadline = MonoTime.now() + Duration.second * 3
+                ingressGate.release(); readerGate.release()
+                attempt({ => setServicePluginAfterIngressStopHookForTest(None<() -> Unit>) })
+                attempt({ => setServicePluginBeforeReaderEndHookForTest(None<(String, () -> Bool) -> Unit>) })
+                attempt({ => setServicePluginAfterOwnerStopHookForTest(None<(String, Bool, String) -> Unit>) })
+                let prior = previousPhase
+                attempt({ => let _ = setServicePluginStopMonotonicPhaseHookForTest(prior) })
+                match (stopFuture) {
+                    case Some(worker) => attempt({ =>
+                        let remaining = cleanupDeadline - MonoTime.now()
+                        if (remaining <= Duration.Zero) { throw Exception("stop_grace_cleanup_deadline") }
+                        let _ = worker.get(remaining)
+                    })
+                    case None => ()
+                }
+                attempt({ => resetServicePluginHostForTest() })
+                attempt({ =>
+                    let remaining = (cleanupDeadline - MonoTime.now()).toMilliseconds()
+                    if (remaining <= 0) { throw Exception("stop_grace_cleanup_deadline") }
+                    if (!resetManagedStdioBrokerForTest(timeoutMs: remaining).ok) { throw Exception("stop_grace_cleanup_broker_pending") }
+                })
+                if (MonoTime.now() > cleanupDeadline) { cleanupErrors.add(Exception("stop_grace_cleanup_deadline")) }
+                attempt({ => gatewayLoggingResetForTest() })
+                attempt({ => Config.logFile = oldLogFile })
+                attempt({ =>
+                    match (oldHome) { case Some(value) => setVariable("METIS_HOME", value) case None => removeVariable("METIS_HOME") }
+                })
+                attempt({ => CliConfig.invalidatePathCache() })
+                attempt({ => println("STOP-GRACE evidence=${home.fileName};formal=${formalBeforeFallback};cleanupOk=${cleanupErrors.isEmpty()}") })
+            }
+            match (bodyError) { case Some(error) => throw error case None => () }
+            if (!cleanupErrors.isEmpty()) { throw cleanupErrors[0] }
+        }
+    }
+
+    public func stopMonoActualCompletion(holdPump: Bool, replaceOwner: Bool, releaseBeforeDeadline!: Bool = true): Unit {
+        withIsolatedServicePluginHostTestHome("stop-monotonic-${holdPump}-${replaceOwner}", { home: Path =>
+            let invokeEntered = home.join("invoke.entered")
+            let invokeRelease = home.join("invoke.release")
+            let exitRelease = home.join("exit.release")
+            let response = this.gitCodeWritebackResponseLine(correlationId: "__CORR__")
+            let script = "printf '%s\\n' '${this.gitCodeInitLine()}'; while IFS= read -r request; do case \"$request\" in " +
+                "*gitcode.writeback.apply_result*) printf ready > '${invokeEntered.toString()}'; " +
+                "while [ ! -f '${invokeRelease.toString()}' ]; do /bin/sleep 0.01; done; " +
+                "corr=$(printf '%s\\n' \"$request\" | /usr/bin/sed -n 's/.*\"correlationId\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p'); " +
+                "printf '%s\\n' '${response}' | /usr/bin/sed \"s/__CORR__/$corr/\";; " +
+                "*stop*) while [ ! -f '${exitRelease.toString()}' ]; do /bin/sleep 0.01; done; exit 0;; esac; done"
+            // Warm the same native/broker lifecycle, then sample with no live owner.
+            for (_ in 0..2) {
+                this.registerGitCodeStdioScript("printf '%s\\n' '${this.gitCodeInitLine()}'; while read ignored; do exit 0; done")
+                setServicePluginSupervisorAutoStartForTest(false)
+                this.stopMonoRequire(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok,
+                    "stop_monotonic_warm_start_failed")
+                this.stopMonoRequire(stopServicePlugin("gitcode-monitor", reason: "stop-monotonic-warm", timeoutMillis: 3000).ok,
+                    "stop_monotonic_warm_stop_failed")
+                this.stopMonoRequire(resetManagedStdioBrokerForTest(timeoutMs: 2000).ok, "stop_monotonic_warm_broker_pending")
+            }
+            let sampleFd = { =>
+                let snapshot = captureCurrentProcessFdSnapshot()
+                this.stopMonoRequire(snapshot.status == "ok", "stop_monotonic_fd_snapshot_unknown")
+                snapshot.fdCount
+            }
+            let baselineFd = sampleFd()
+            let baselineTasks = (getThreadCount(), getBlockingThreadCount())
+            let threadsWithin = { =>
+                getThreadCount() <= baselineTasks[0] && getBlockingThreadCount() <= baselineTasks[1]
+            }
+            this.registerGitCodeStdioScript(script)
+            setServicePluginSupervisorAutoStartForTest(false)
+            let stopGate = ServicePluginTestGate()
+            let pumpGate = ServicePluginTestGate()
+            let joinGate = ServicePluginTestGate()
+            var invokeFuture = None<Future<CapabilityInvokeResult>>
+            var stopFuture = None<Future<ServiceStopResult>>
+            let cleanupErrors = ArrayList<Exception>()
+            let attempt = { action: () -> Unit =>
+                try { action() } catch (error: Exception) { cleanupErrors.add(error) }
+            }
+            var bodyError = None<Exception>
+            var previousPhase = None<(String, String) -> Unit>
+            try {
+                this.stopMonoRequire(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok,
+                    "stop_monotonic_start_failed")
+                let before = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                let owner = servicePluginActiveIdentityForTest("gitcode-monitor").getOrThrow()[0]
+                let originalBirth = observeProcessBirthIdentity(before.pid).getOrThrow()
+                previousPhase = setServicePluginStopMonotonicPhaseHookForTest(Some({ observed: String, phase: String =>
+                    if (observed == owner && phase == "pump_return") { pumpGate.enterAndWait() }
+                    if (observed == owner && phase == "stop_join") { joinGate.signal() }
+                }))
+                setServicePluginAfterIngressStopHookForTest(Some({ => stopGate.enterAndWait() }))
+                invokeFuture = Some(spawn { invokeGitCodeWritebackApplyResult("gitcode-monitor", "{}", 5000) })
+                this.stopMonoRequire(this.waitForFile(invokeEntered, timeoutMillis: 2000), "stop_monotonic_invoke_not_entered")
+                stopFuture = Some(spawn { stopServicePlugin("gitcode-monitor", reason: "stop-monotonic", timeoutMillis: 3000) })
+                this.stopMonoRequire(stopGate.awaitEntered(2000), "stop_monotonic_ingress_not_entered")
+                File.writeTo(invokeRelease, "release".toArray())
+                let invoked = invokeFuture.getOrThrow().get(Duration.second * 2)
+                invokeFuture = None<Future<CapabilityInvokeResult>>
+                this.stopMonoRequire(invoked.ok, "stop_monotonic_real_invoke_failed")
+                File.writeTo(exitRelease, "release".toArray())
+                this.stopMonoRequire(pumpGate.awaitEntered(2000), "stop_monotonic_natural_cleanup_not_completed")
+                let natural = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                this.stopMonoRequire(natural.instanceId == before.instanceId && natural.pid == before.pid &&
+                    natural.status == "cleanup_pending" && servicePluginCleanupPendingCountForTest() == 1 &&
+                    servicePluginCleanupPendingIdentityForTest("gitcode-monitor").getOrThrow()[0] == owner, "stop_monotonic_natural_owner_not_terminal")
+                let gone = probeProcessBirthIdentity(originalBirth, MonoTime.now() + Duration.second * 2)
+                this.stopMonoRequire(gone.conclusive && !gone.alive, "stop_monotonic_original_birth_not_gone")
+                if (replaceOwner) {
+                    let blocked = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                    this.stopMonoRequire(!blocked.ok && blocked.status == "cleanup_pending" &&
+                        getServicePluginSnapshot("gitcode-monitor").getOrThrow().instanceId == before.instanceId &&
+                        managedStdioBroker().snapshot().ownerCount == 0, "stop_monotonic_join_responsibility_admitted_successor")
+                }
+                if (!holdPump || replaceOwner) { pumpGate.release() }
+                stopGate.release()
+                if (holdPump && !replaceOwner) {
+                    this.stopMonoRequire(joinGate.awaitEntered(2500), "stop_monotonic_original_pump_not_joined")
+                    var completedWhileHeld = false
+                    try {
+                        let _ = stopFuture.getOrThrow().get(Duration.millisecond * 50)
+                        completedWhileHeld = true
+                    } catch (_: TimeoutException) { () }
+                    this.stopMonoRequire(!completedWhileHeld, "stop_monotonic_pump_hold_was_ignored")
+                    if (releaseBeforeDeadline) { pumpGate.release() }
+                }
+                let stopped = stopFuture.getOrThrow().get(Duration.second * 4)
+                stopFuture = None<Future<ServiceStopResult>>
+                if (replaceOwner) {
+                    this.stopMonoRequire(stopped.ok && stopped.status == "stopped", "stop_monotonic_old_stop_not_completed")
+                    this.stopMonoRequire(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok,
+                        "stop_monotonic_successor_not_started_after_join")
+                    let current = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                    this.stopMonoRequire(current.instanceId != before.instanceId && current.pid > 1 && current.status == "running",
+                        "stop_monotonic_successor_identity_reused")
+                    setServicePluginAfterIngressStopHookForTest(None<() -> Unit>)
+                    this.stopMonoRequire(stopServicePlugin("gitcode-monitor", reason: "stop-monotonic-successor", timeoutMillis: 3000).ok,
+                        "stop_monotonic_successor_stop_failed")
+                } else if (!releaseBeforeDeadline) {
+                    this.stopMonoRequire(!stopped.ok && stopped.status == "cleanup_pending", "stop_monotonic_held_pump_reported_success")
+                    this.stopMonoRequire(stopped.diagnostic == "event_pump_join_pending", "stop_monotonic_pending_pump_diagnostic_incorrect")
+                    let retryHeld = stopServicePlugin("gitcode-monitor", reason: "stop-monotonic-still-held", timeoutMillis: 200)
+                    this.stopMonoRequire(!retryHeld.ok && retryHeld.status == "cleanup_pending", "stop_monotonic_retry_lost_original_pump")
+                    let blocked = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 200)
+                    this.stopMonoRequire(!blocked.ok && blocked.status == "cleanup_pending", "stop_monotonic_retry_admitted_new_owner")
+                    pumpGate.release()
+                    let retryReleased = stopServicePlugin("gitcode-monitor", reason: "stop-monotonic-released", timeoutMillis: 2000)
+                    this.stopMonoRequire(retryReleased.ok && retryReleased.status == "stopped", "stop_monotonic_retry_did_not_join_original_pump")
+                } else {
+                    let current = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                    this.stopMonoRequire(stopped.ok && stopped.status == "stopped" && current.instanceId == before.instanceId &&
+                        current.pid == 0 && current.status == "stopped", "stop_monotonic_same_owner_not_stopped")
+                }
+                this.stopMonoRequire(servicePluginCleanupPendingCountForTest() == 0 &&
+                    managedStdioBroker().snapshot().ownerCount == 0, "stop_monotonic_owned_resources_pending")
+                this.stopMonoRequire(resetManagedStdioBrokerForTest(timeoutMs: 2000).ok, "stop_monotonic_broker_close_pending")
+                let deadline = MonoTime.now() + Duration.second * 2
+                while (MonoTime.now() < deadline && (sampleFd() != baselineFd || !threadsWithin())) {
+                    sleep(Duration.millisecond * 5)
+                }
+                this.stopMonoRequire(sampleFd() == baselineFd && threadsWithin(),
+                    "stop_monotonic_resource_baseline_not_restored")
+                println("STOP-MONO held=${holdPump};replacement=${replaceOwner};formal=true")
+            } catch (error: Exception) { bodyError = Some(error) } finally {
+                // Every release and every owned join remains reachable after any proof/I/O failure.
+                let cleanupDeadline = MonoTime.now() + Duration.second * 3
+                stopGate.release(); pumpGate.release()
+                attempt({ => File.writeTo(invokeRelease, "release".toArray()) })
+                attempt({ => File.writeTo(exitRelease, "release".toArray()) })
+                setServicePluginAfterIngressStopHookForTest(None<() -> Unit>)
+                let prior = previousPhase
+                attempt({ => let _ = setServicePluginStopMonotonicPhaseHookForTest(prior) })
+                match (invokeFuture) {
+                    case Some(worker) => attempt({ =>
+                        let remaining = cleanupDeadline - MonoTime.now()
+                        if (remaining <= Duration.Zero) { throw Exception("stop_monotonic_cleanup_deadline") }
+                        let _ = worker.get(remaining)
+                    })
+                    case None => ()
+                }
+                match (stopFuture) {
+                    case Some(worker) => attempt({ =>
+                        let remaining = cleanupDeadline - MonoTime.now()
+                        if (remaining <= Duration.Zero) { throw Exception("stop_monotonic_cleanup_deadline") }
+                        let _ = worker.get(remaining)
+                    })
+                    case None => ()
+                }
+                attempt({ => resetServicePluginHostForTest() })
+                if (MonoTime.now() > cleanupDeadline) { cleanupErrors.add(Exception("stop_monotonic_cleanup_deadline")) }
+                @Expect(cleanupErrors.isEmpty(), true)
+            }
+            match (bodyError) { case Some(error) => throw error case None => () }
+            if (!cleanupErrors.isEmpty()) { throw cleanupErrors[0] }
+        })
+    }
+
     @TestCase
     public func stdioInitializeFalseReturnsInitializeFailedWithStatusDiagnostic(): Unit {
         this.registerStdio("{ \"ok\": true, \"status\": \"ok\" }", initPayload: "{ \"ok\": false, \"status\": \"config_missing\" }")
@@ -6568,6 +6919,30 @@ public class ServicePluginHostTest {
         } finally {
             resetServicePluginHostForTest()
         }
+    }
+}
+
+
+@When[os == "macOS"]
+@Test
+public class ServicePluginStopMonotonicTest {
+    @TestCase
+    public func stopGraceU1GracefulExitWaitsForActualReaderSettlement(): Unit {
+        ServicePluginHostTest().stopGraceActualOwnerConfirmation()
+    }
+
+    @TestCase
+    public func stopMonoU1CompletedNaturalOwnerStopsMonotonically(): Unit { ServicePluginHostTest().stopMonoActualCompletion(false, false) }
+
+    @TestCase
+    public func stopMonoB1OriginalPumpMustReallyFinish(): Unit { ServicePluginHostTest().stopMonoActualCompletion(true, false) }
+
+    @TestCase
+    public func stopMonoN1PendingPumpBlocksSuccessorUntilRealJoin(): Unit { ServicePluginHostTest().stopMonoActualCompletion(false, true) }
+
+    @TestCase
+    public func stopMonoN3HeldOriginalPumpRemainsOwnedAcrossRetry(): Unit {
+        ServicePluginHostTest().stopMonoActualCompletion(true, false, releaseBeforeDeadline: false)
     }
 }
 
