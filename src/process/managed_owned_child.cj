@@ -387,8 +387,10 @@ private class ManagedNativeChild <: ManagedOwnedChild {
 }
 
 @When[os == "macOS"]
-private func managedNativeStrings(values: Array<String>): CPointer<CString> {
-    let result = unsafe { LibC.malloc<CString>(count: values.size + 1) }
+private func managedNativeStrings(values: Array<String>, failAllocation!: Bool = false): CPointer<CString> {
+    let result = if (failAllocation) { CPointer<CString>() }
+        else { unsafe { LibC.malloc<CString>(count: values.size + 1) } }
+    if (result.isNull()) { throw Exception("owned_process_allocation_failed") }
     unsafe { for (index in 0..=values.size) { result.write(index, CString(CPointer<Byte>())) } }
     try {
         for (index in 0..values.size) {
@@ -461,7 +463,9 @@ private func managedNativeExecSearch(command: String, arguments: Array<String>, 
     (if (denied) { Int32(13) } else { Int32(2) }, Int32(0))
 }
 
-enum ManagedNativeLaunchFault { NoFault | InvalidProcessGroup | InvalidDupAction | AfterSpawnSetup }
+enum ManagedNativeLaunchFault {
+    NoFault | InvalidProcessGroup | InvalidDupAction | AfterSpawnSetup | ArgumentsAllocation | EnvironmentAllocation
+}
 
 @When[os == "macOS"]
 func managedNativeLaunch(command: String, arguments: Array<String>, workingDirectory: ?Path,
@@ -483,7 +487,10 @@ func managedNativeLaunch(command: String, arguments: Array<String>, workingDirec
     var nullPath = unsafe { LibC.mallocCString("/dev/null") }
     var cwd = CString(CPointer<Byte>())
     try {
-        argv = managedNativeStrings(args.toArray()); envp = managedNativeStrings(entries.toArray())
+        let failArguments = match (fault) { case ManagedNativeLaunchFault.ArgumentsAllocation => true case _ => false }
+        argv = managedNativeStrings(args.toArray(), failAllocation: failArguments)
+        let failEnvironment = match (fault) { case ManagedNativeLaunchFault.EnvironmentAllocation => true case _ => false }
+        envp = managedNativeStrings(entries.toArray(), failAllocation: failEnvironment)
         if (unsafe { posix_spawn_file_actions_init(inout actions) } != 0) { throw Exception("owned_process_actions_failed") }
         actionsReady = true
         if (unsafe { posix_spawnattr_init(inout attributes) } != 0) { throw Exception("owned_process_attributes_failed") }
@@ -526,6 +533,8 @@ func managedNativeLaunch(command: String, arguments: Array<String>, workingDirec
         }
         match (fault) {
             case ManagedNativeLaunchFault.NoFault | ManagedNativeLaunchFault.AfterSpawnSetup => ()
+            case ManagedNativeLaunchFault.ArgumentsAllocation | ManagedNativeLaunchFault.EnvironmentAllocation =>
+                throw Exception("owned_process_fault_not_rejected")
             case ManagedNativeLaunchFault.InvalidProcessGroup =>
                 if (unsafe { posix_spawnattr_setpgroup(inout attributes, -1) } != 0) {
                     throw Exception("owned_process_attributes_failed")

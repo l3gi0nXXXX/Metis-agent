@@ -191,6 +191,82 @@ public class ManagedOwnedChildTest {
     }
 
     @TestCase
+    public func rNativeAllocationU1ArgumentsArrayNullDoesNotSpawn(): Unit {
+        ownedTestContext({ directory, parent =>
+            let baseline = ownedTestFdCount()
+            let marker = directory.join("arguments-allocation-中文😀.marker")
+            var longValue = ""
+            for (_ in 0..256) { longValue += "参数分配中文😀" }
+            let environment = HashMap<String, String>()
+            environment["PATH"] = "/usr/bin:/bin"
+            environment["METIS_ALLOCATION_VALUE"] = longValue
+            for (_ in 0..32) {
+                var status = ""
+                var returned = None<ManagedOwnedChild>
+                try {
+                    returned = Some(managedNativeLaunch("/usr/bin/touch",
+                        [marker.toString(), directory.join(longValue).toString()], Some(directory),
+                        Some<Map<String, String>>(environment),
+                        [ProcessRedirect.Pipe, ProcessRedirect.Pipe, ProcessRedirect.Pipe],
+                        fault: ManagedNativeLaunchFault.ArgumentsAllocation))
+                } catch (error: Exception) { status = error.message }
+                finally {
+                    if (let Some(child) <- returned) {
+                        try { child.terminate(force: true); let _ = child.wait(timeout: Some(Duration.second * 5)) }
+                        finally { child.closeStreams() }
+                    }
+                }
+                @Expect(status, "owned_process_allocation_failed")
+                @Expect(returned.isNone(), true)
+                @Expect(exists(marker), false)
+                @Expect(ownedTestFdCount(), baseline)
+                for (descriptor in 0..3) { @Expect(unsafe { fcntl(Int32(descriptor), 1) } >= 0, true) }
+                let context = managedRecoveryContext()
+                @Expect(context[0], directory.toString())
+                @Expect(context[1], parent)
+            }
+        })
+    }
+
+    @TestCase
+    public func rNativeAllocationU2EnvironmentArrayNullReleasesArguments(): Unit {
+        ownedTestContext({ directory, parent =>
+            let baseline = ownedTestFdCount()
+            let marker = directory.join("environment-allocation-中文😀.marker")
+            var longValue = ""
+            for (_ in 0..256) { longValue += "环境分配中文😀" }
+            let environment = HashMap<String, String>()
+            environment["PATH"] = "/usr/bin:/bin"
+            environment["METIS_ALLOCATION_VALUE"] = longValue
+            for (_ in 0..32) {
+                var status = ""
+                var returned = None<ManagedOwnedChild>
+                try {
+                    returned = Some(managedNativeLaunch("/usr/bin/touch",
+                        [marker.toString(), directory.join(longValue).toString()], Some(directory),
+                        Some<Map<String, String>>(environment),
+                        [ProcessRedirect.Pipe, ProcessRedirect.Pipe, ProcessRedirect.Pipe],
+                        fault: ManagedNativeLaunchFault.EnvironmentAllocation))
+                } catch (error: Exception) { status = error.message }
+                finally {
+                    if (let Some(child) <- returned) {
+                        try { child.terminate(force: true); let _ = child.wait(timeout: Some(Duration.second * 5)) }
+                        finally { child.closeStreams() }
+                    }
+                }
+                @Expect(status, "owned_process_allocation_failed")
+                @Expect(returned.isNone(), true)
+                @Expect(exists(marker), false)
+                @Expect(ownedTestFdCount(), baseline)
+                for (descriptor in 0..3) { @Expect(unsafe { fcntl(Int32(descriptor), 1) } >= 0, true) }
+                let context = managedRecoveryContext()
+                @Expect(context[0], directory.toString())
+                @Expect(context[1], parent)
+            }
+        })
+    }
+
+    @TestCase
     public func rS1LN1ClosedPeerWriteDoesNotSignalTheHost(): Unit {
         let baseline = ownedTestFdCount()
         let child = try { managedNativeLaunch("/usr/bin/true", [], None, None,
